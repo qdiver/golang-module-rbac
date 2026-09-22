@@ -129,14 +129,14 @@ func newMFAFixture(t *testing.T) (*auth.MFAService, *fakeMFAStore, *fakeAdminSto
 	users := newFakeAdminStore()
 	sealer, err := auth.NewSealerFromHex(testSealKeyHex)
 	require.NoError(t, err)
-	svc, err := auth.NewMFAService(store, users, sealer, stubClock{mfaNow}, &stubIDs{}, "Security Assessment")
+	svc, err := auth.NewMFAService(store, users, sealer, stubClock{mfaNow}, &stubIDs{}, "Security Assessment", testTable(t))
 	require.NoError(t, err)
 	return svc, store, users
 }
 
 func mfaActor() auth.Identity {
 	return auth.Identity{
-		UserID: "u-1", OrgID: "org-1", Role: auth.RoleAdmin,
+		UserID: "u-1", OrgID: "org-1", Role: testAdmin,
 		Actor: "person@example.com", Email: "person@example.com",
 	}
 }
@@ -389,7 +389,7 @@ func TestATOTPCodeThatCannotBeRecordedIsRefused(t *testing.T) {
 	sealer, err := auth.NewSealerFromHex(testSealKeyHex)
 	require.NoError(t, err)
 	svcLater, err := auth.NewMFAService(store, newFakeAdminStore(), sealer,
-		stubClock{later}, &stubIDs{}, "Security Assessment")
+		stubClock{later}, &stubIDs{}, "Security Assessment", testTable(t))
 	require.NoError(t, err)
 
 	// It verifies when the step can be recorded...
@@ -431,7 +431,7 @@ func TestMFATokensAreSingleUseAndExpire(t *testing.T) {
 func TestNewMFAServiceRequiresASealer(t *testing.T) {
 	t.Parallel()
 
-	_, err := auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), nil, stubClock{mfaNow}, &stubIDs{}, "X")
+	_, err := auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), nil, stubClock{mfaNow}, &stubIDs{}, "X", testTable(t))
 	assert.ErrorIs(t, err, auth.ErrNoSealKey,
 		"a second factor with no sealer would store its secret in plaintext")
 }
@@ -606,22 +606,23 @@ func TestNewMFAServiceRequiresItsCollaborators(t *testing.T) {
 	sealer, err := auth.NewSealerFromHex(testSealKeyHex)
 	require.NoError(t, err)
 
-	_, err = auth.NewMFAService(nil, newFakeAdminStore(), sealer, stubClock{mfaNow}, &stubIDs{}, "X")
+	_, err = auth.NewMFAService(nil, newFakeAdminStore(), sealer, stubClock{mfaNow}, &stubIDs{}, "X", testTable(t))
 	assert.Error(t, err)
-	_, err = auth.NewMFAService(newFakeMFAStore(), nil, sealer, stubClock{mfaNow}, &stubIDs{}, "X")
+	_, err = auth.NewMFAService(newFakeMFAStore(), nil, sealer, stubClock{mfaNow}, &stubIDs{}, "X", testTable(t))
 	assert.Error(t, err)
-	_, err = auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), sealer, nil, &stubIDs{}, "X")
+	_, err = auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), sealer, nil, &stubIDs{}, "X", testTable(t))
 	assert.Error(t, err)
-	_, err = auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), sealer, stubClock{mfaNow}, nil, "X")
+	_, err = auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), sealer, stubClock{mfaNow}, nil, "X", testTable(t))
 	assert.Error(t, err)
+	_, err = auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), sealer, stubClock{mfaNow}, &stubIDs{}, "X", nil)
+	assert.Error(t, err, "no permission table was refused")
 
-	// An empty issuer is defaulted rather than refused: it is a display
-	// string on somebody's phone, not a security parameter.
-	svc, err := auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), sealer, stubClock{mfaNow}, &stubIDs{}, "")
-	require.NoError(t, err)
-	e, err := svc.BeginEnrollment(context.Background(), mfaActor())
-	require.NoError(t, err)
-	assert.Contains(t, e.URI, "Security%20Assessment")
+	// An empty issuer is refused rather than defaulted: it is what every
+	// enrolled authenticator app shows next to the account, and this
+	// package has no generic name that would be right for someone else's
+	// deployment.
+	_, err = auth.NewMFAService(newFakeMFAStore(), newFakeAdminStore(), sealer, stubClock{mfaNow}, &stubIDs{}, "", testTable(t))
+	assert.Error(t, err, "an empty issuer was accepted")
 }
 
 // --- the lockout valve ------------------------------------------------------
@@ -639,7 +640,7 @@ func TestAnAdministratorCanClearAStrandedUsersFactor(t *testing.T) {
 	enrollAndConfirm(t, svc)
 	require.True(t, svc.RequiresSecondFactor(context.Background(), "u-1"))
 
-	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: auth.RoleAdmin}
+	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 	target := auth.User{ID: "u-1", OrgID: "org-1", Email: "person@example.com"}
 
 	require.NoError(t, svc.ClearFactorFor(context.Background(), admin, "u-1", target))
@@ -657,7 +658,7 @@ func TestClearingAFactorNeedsTheManagementPermission(t *testing.T) {
 	svc, _, _ := newMFAFixture(t)
 	enrollAndConfirm(t, svc)
 
-	analyst := auth.Identity{UserID: "u-analyst", OrgID: "org-1", Role: auth.RoleAnalyst}
+	analyst := auth.Identity{UserID: "u-analyst", OrgID: "org-1", Role: testAnalyst}.WithPermissions(testTable(t))
 	target := auth.User{ID: "u-1", OrgID: "org-1"}
 
 	assert.ErrorIs(t, svc.ClearFactorFor(context.Background(), analyst, "u-1", target), auth.ErrNotPermitted)
@@ -673,7 +674,7 @@ func TestClearingAFactorCannotReachAnotherOrganization(t *testing.T) {
 	svc, _, _ := newMFAFixture(t)
 	enrollAndConfirm(t, svc)
 
-	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: auth.RoleAdmin}
+	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 	elsewhere := auth.User{ID: "u-1", OrgID: "org-2"}
 
 	assert.ErrorIs(t, svc.ClearFactorFor(context.Background(), admin, "u-1", elsewhere), auth.ErrNotPermitted)

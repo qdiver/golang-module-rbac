@@ -121,14 +121,15 @@ type Admin struct {
 	policies PolicyStore
 	clock    Clock
 	ids      IDGen
+	table    *PermissionTable
 }
 
 // NewAdmin builds an Admin. Every dependency is required.
-func NewAdmin(store AdminStore, clock Clock, ids IDGen) (*Admin, error) {
-	if store == nil || clock == nil || ids == nil {
-		return nil, errors.New("auth: NewAdmin requires a store, a clock and an ID generator")
+func NewAdmin(store AdminStore, clock Clock, ids IDGen, table *PermissionTable) (*Admin, error) {
+	if store == nil || clock == nil || ids == nil || table == nil {
+		return nil, errors.New("auth: NewAdmin requires a store, a clock, an ID generator and a permission table")
 	}
-	return &Admin{store: store, clock: clock, ids: ids}, nil
+	return &Admin{store: store, clock: clock, ids: ids, table: table}, nil
 }
 
 // WithPolicies attaches the per-organization password policy (ADR-0029).
@@ -226,10 +227,10 @@ func (a *Admin) recordChange(ctx context.Context, userID, previousHash string, p
 // hold once reports are scoped (ADR-0027 phase 3), when an account in the
 // wrong organization becomes a way to read another customer's findings.
 func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name string, role Role, password string) (User, error) {
-	if !actor.Can(PermManageUsers) {
+	if !actor.Can(a.table.ManageUsers) {
 		return User{}, ErrNotPermitted
 	}
-	if !role.Valid() {
+	if !a.table.Valid(role) {
 		return User{}, fmt.Errorf("auth: unknown role %q", role)
 	}
 	email = strings.TrimSpace(email)
@@ -277,7 +278,7 @@ func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name stri
 
 // ListUsers returns the accounts in the caller's organization.
 func (a *Admin) ListUsers(ctx context.Context, actor Identity) ([]User, error) {
-	if !actor.Can(PermManageUsers) {
+	if !actor.Can(a.table.ManageUsers) {
 		return nil, ErrNotPermitted
 	}
 	return a.store.ListUsers(ctx, actor.OrgID)
@@ -297,7 +298,7 @@ func (a *Admin) DisableUser(ctx context.Context, actor Identity, userID string) 
 	if target.Disabled {
 		return nil // already disabled; nothing to do and nothing to report
 	}
-	if target.Role == RoleAdmin {
+	if target.Role == a.table.AdminRole {
 		lastAdmin, err := a.isLastEnabledAdmin(ctx, target)
 		if err != nil {
 			return err
@@ -361,7 +362,7 @@ func (a *Admin) isLastEnabledAdmin(ctx context.Context, target User) (bool, erro
 		return false, fmt.Errorf("auth: count administrators: %w", err)
 	}
 	for _, u := range users {
-		if u.ID != target.ID && u.Role == RoleAdmin && !u.Disabled {
+		if u.ID != target.ID && u.Role == a.table.AdminRole && !u.Disabled {
 			return false, nil
 		}
 	}
@@ -388,7 +389,7 @@ func (a *Admin) DeleteUser(ctx context.Context, actor Identity, userID string) e
 	if err != nil {
 		return err
 	}
-	if target.Role == RoleAdmin && !target.Disabled {
+	if target.Role == a.table.AdminRole && !target.Disabled {
 		last, err := a.isLastEnabledAdmin(ctx, target)
 		if err != nil {
 			return err
@@ -410,7 +411,7 @@ func (a *Admin) DeleteUser(ctx context.Context, actor Identity, userID string) e
 // with no in-product way out. Not on the last enabled administrator either,
 // for the same reason.
 func (a *Admin) SetRole(ctx context.Context, actor Identity, userID string, role Role) error {
-	if !role.Valid() {
+	if !a.table.Valid(role) {
 		return fmt.Errorf("auth: unknown role %q", role)
 	}
 	target, err := a.manageableTarget(ctx, actor, userID)
@@ -420,7 +421,7 @@ func (a *Admin) SetRole(ctx context.Context, actor Identity, userID string, role
 	if target.Role == role {
 		return nil // already there; nothing to do and nothing to report
 	}
-	if target.Role == RoleAdmin && role != RoleAdmin && !target.Disabled {
+	if target.Role == a.table.AdminRole && role != a.table.AdminRole && !target.Disabled {
 		last, err := a.isLastEnabledAdmin(ctx, target)
 		if err != nil {
 			return err
@@ -444,7 +445,7 @@ func (a *Admin) SetRole(ctx context.Context, actor Identity, userID string, role
 // way they would if each one re-implemented them, and the way a fourth
 // operation added later would get them for free.
 func (a *Admin) manageableTarget(ctx context.Context, actor Identity, userID string) (User, error) {
-	if !actor.Can(PermManageUsers) {
+	if !actor.Can(a.table.ManageUsers) {
 		return User{}, ErrNotPermitted
 	}
 	if userID == actor.UserID {
@@ -597,19 +598,19 @@ func (a *Admin) ResetPassword(ctx context.Context, actor Identity, userID, next 
 // plaintext exactly once.
 //
 // Any authenticated caller may mint their own keys — this needs no
-// PermManageUsers — because a key is not new authority, it is a second way
-// to present authority the caller already has. The clamp is what makes that
-// true: the requested role is reduced to the caller's own, so an analyst
-// issuing a read-only key to CI is ordinary, and an analyst minting an admin
-// key is impossible.
+// ManageUsers permission — because a key is not new authority, it is a
+// second way to present authority the caller already has. The clamp is what
+// makes that true: the requested role is reduced to the caller's own, so a
+// weaker role issuing a read-only key to CI is ordinary, and a weaker role
+// minting an admin key is impossible.
 func (a *Admin) MintAPIKey(ctx context.Context, actor Identity, name string, requested Role) (string, APIKeyInfo, error) {
 	if actor.UserID == "" {
 		return "", APIKeyInfo{}, ErrNotPermitted
 	}
-	if !requested.Valid() {
+	if !a.table.Valid(requested) {
 		requested = actor.Role
 	}
-	granted := requested.AtMost(actor.Role)
+	granted := a.table.AtMost(requested, actor.Role)
 
 	key, hash, err := NewAPIKey()
 	if err != nil {
@@ -690,7 +691,7 @@ func (a *Admin) PasswordPolicy(ctx context.Context, actor Identity) (Policy, err
 // It returns the stored policy rather than nothing, so a client renders what
 // was saved instead of what it hoped was saved.
 func (a *Admin) SetPasswordPolicy(ctx context.Context, actor Identity, p Policy) (Policy, error) {
-	if !actor.Can(PermManageUsers) {
+	if !actor.Can(a.table.ManageUsers) {
 		return Policy{}, ErrNotPermitted
 	}
 	if a.policies == nil {

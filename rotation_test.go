@@ -45,7 +45,7 @@ func loginWithPolicy(t *testing.T, p *rotationPolicies, changedAt time.Time) (*f
 	store := newFakeStore()
 	store.withUser(t, User{
 		ID: "u-1", OrgID: "org-1", Email: "person@example.com",
-		Name: "Person", Role: RoleAdmin, PasswordChangedAt: changedAt,
+		Name: "Person", Role: testAdmin, PasswordChangedAt: changedAt,
 	}, rotationPassword)
 
 	a := newTestAuthenticator(t, store)

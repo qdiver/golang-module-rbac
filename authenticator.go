@@ -49,6 +49,7 @@ type Authenticator struct {
 	store Store
 	clock Clock
 	ids   IDGen
+	table *PermissionTable
 
 	// policies supplies the per-organization password policy, for rotation
 	// (ADR-0029). Optional: with none, no password ever expires, which is
@@ -173,11 +174,11 @@ func (r LoginResult) MFARequired() bool { return r.MFAToken != "" }
 
 // NewAuthenticator builds an Authenticator. Every dependency is required;
 // there is no safe default for any of them.
-func NewAuthenticator(store Store, clock Clock, ids IDGen) (*Authenticator, error) {
-	if store == nil || clock == nil || ids == nil {
-		return nil, errors.New("auth: NewAuthenticator requires a store, a clock and an ID generator")
+func NewAuthenticator(store Store, clock Clock, ids IDGen, table *PermissionTable) (*Authenticator, error) {
+	if store == nil || clock == nil || ids == nil || table == nil {
+		return nil, errors.New("auth: NewAuthenticator requires a store, a clock, an ID generator and a permission table")
 	}
-	return &Authenticator{store: store, clock: clock, ids: ids}, nil
+	return &Authenticator{store: store, clock: clock, ids: ids, table: table}, nil
 }
 
 // Login verifies an email and password and mints a session.
@@ -249,7 +250,7 @@ func (a *Authenticator) Login(ctx context.Context, email, password string) (Logi
 		if mfaErr != nil {
 			return LoginResult{}, fmt.Errorf("auth: begin second factor: %w", mfaErr)
 		}
-		return LoginResult{MFAToken: mfaToken, Identity: identityOf(u, SchemeSession)}, nil
+		return LoginResult{MFAToken: mfaToken, Identity: identityOf(u, SchemeSession, a.table)}, nil
 	}
 
 	return a.issueSession(ctx, u, now, "")
@@ -284,7 +285,7 @@ func (a *Authenticator) issueSession(ctx context.Context, u User, now time.Time,
 		return LoginResult{}, fmt.Errorf("auth: persist session: %w", err)
 	}
 
-	id := identityOf(u, SchemeSession)
+	id := identityOf(u, SchemeSession, a.table)
 	id.PasswordExpired = expired
 	return LoginResult{SessionToken: token, Identity: id, FactorUsed: used}, nil
 }
@@ -327,7 +328,7 @@ func (a *Authenticator) CompleteMFA(ctx context.Context, mfaToken, code string) 
 		// failed second factor against the account it was attempted on —
 		// without it, the log would show an anonymous failure and a
 		// brute-force attempt on one account would be invisible.
-		return LoginResult{Identity: identityOf(u, SchemeSession)}, err
+		return LoginResult{Identity: identityOf(u, SchemeSession, a.table)}, err
 	}
 
 	return a.issueSession(ctx, u, a.clock.Now(), kind)
@@ -484,7 +485,7 @@ func (a *Authenticator) CompleteGoogleLogin(ctx context.Context, state, code str
 		if mfaErr != nil {
 			return LoginResult{}, fmt.Errorf("auth: begin second factor: %w", mfaErr)
 		}
-		return LoginResult{MFAToken: mfaToken, Identity: identityOf(u, SchemeSession)}, nil
+		return LoginResult{MFAToken: mfaToken, Identity: identityOf(u, SchemeSession, a.table)}, nil
 	}
 
 	return a.issueSession(ctx, u, now, FactorGoogle)
@@ -647,7 +648,7 @@ func (a *Authenticator) Logout(ctx context.Context, token string) error {
 // change_log.actor is read by a person trying to work out who did
 // something: "alice@example.com" always answers that, and an empty name
 // must never produce an empty actor.
-func identityOf(u User, scheme Scheme) Identity {
+func identityOf(u User, scheme Scheme, table *PermissionTable) Identity {
 	actor := u.Name
 	if strings.TrimSpace(actor) == "" {
 		actor = u.Email
@@ -659,7 +660,7 @@ func identityOf(u User, scheme Scheme) Identity {
 		Actor:  actor,
 		Email:  u.Email,
 		Scheme: scheme,
-	}
+	}.WithPermissions(table)
 }
 
 // IdentityOf is identityOf, exported for Store implementations, which build
@@ -667,4 +668,11 @@ func identityOf(u User, scheme Scheme) Identity {
 // fallback that Login does. Two copies of that rule would drift, and the
 // symptom would be an audit trail where the same person appears under two
 // names depending on how they authenticated.
-func IdentityOf(u User, scheme Scheme) Identity { return identityOf(u, scheme) }
+//
+// table should be the same PermissionTable the Authenticator or Admin that
+// owns this Store was built with — Store implementations typically hold
+// their own reference to it for exactly this call, set once when they are
+// constructed.
+func IdentityOf(u User, scheme Scheme, table *PermissionTable) Identity {
+	return identityOf(u, scheme, table)
+}

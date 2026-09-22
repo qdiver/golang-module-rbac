@@ -131,11 +131,11 @@ func stepUpFixture(t *testing.T, withFactor bool) (*Authenticator, *stepUpStore,
 	t.Helper()
 	store := newFakeStore()
 	store.withUser(t, User{
-		ID: "u-1", OrgID: "org-1", Email: "person@example.com", Role: RoleAdmin,
+		ID: "u-1", OrgID: "org-1", Email: "person@example.com", Role: testAdmin,
 	}, stepUpPassword)
 
 	steps := &stepUpStore{}
-	a, err := NewAuthenticator(store, fixedClock{testNow}, &seqIDs{})
+	a, err := NewAuthenticator(store, fixedClock{testNow}, &seqIDs{}, testTable(t))
 	require.NoError(t, err)
 	a = a.WithStepUp(steps)
 
@@ -143,7 +143,7 @@ func stepUpFixture(t *testing.T, withFactor bool) (*Authenticator, *stepUpStore,
 		sealer, sErr := NewSealerFromHex(stepUpKeyHex)
 		require.NoError(t, sErr)
 		svc, mErr := NewMFAService(&stepUpMFAStore{}, &stepUpAdminStore{}, sealer,
-			fixedClock{testNow}, &seqIDs{}, "Test")
+			fixedClock{testNow}, &seqIDs{}, "Test", testTable(t))
 		require.NoError(t, mErr)
 
 		// An active factor for u-1, confirmed with a real code.
@@ -162,7 +162,7 @@ func stepUpFixture(t *testing.T, withFactor bool) (*Authenticator, *stepUpStore,
 
 func stepUpActor() Identity {
 	return Identity{
-		UserID: "u-1", OrgID: "org-1", Role: RoleAdmin,
+		UserID: "u-1", OrgID: "org-1", Role: testAdmin,
 		Actor: "person@example.com", SessionID: "sess-1", Scheme: SchemeSession,
 	}
 }
@@ -220,7 +220,7 @@ func TestStepUpNeedsASessionToMark(t *testing.T) {
 	t.Parallel()
 
 	a, steps, _ := stepUpFixture(t, false)
-	keyActor := Identity{UserID: "u-1", OrgID: "org-1", Role: RoleAdmin, Scheme: SchemeAPIKey}
+	keyActor := Identity{UserID: "u-1", OrgID: "org-1", Role: testAdmin, Scheme: SchemeAPIKey}
 
 	assert.ErrorIs(t, a.StepUp(context.Background(), keyActor, stepUpPassword), ErrStepUpRequired)
 	assert.Empty(t, steps.stamped)
@@ -258,7 +258,7 @@ func TestStepUpWithNoStoreIsAnError(t *testing.T) {
 
 	store := newFakeStore()
 	store.withUser(t, User{ID: "u-1", OrgID: "org-1", Email: "person@example.com"}, stepUpPassword)
-	a, err := NewAuthenticator(store, fixedClock{testNow}, &seqIDs{})
+	a, err := NewAuthenticator(store, fixedClock{testNow}, &seqIDs{}, testTable(t))
 	require.NoError(t, err)
 
 	require.Error(t, a.StepUp(context.Background(), stepUpActor(), stepUpPassword))
@@ -438,7 +438,7 @@ func TestAnAPIKeyCannotStepUpWithAPasskey(t *testing.T) {
 	a, _, _ := stepUpFixture(t, false)
 	a = a.WithPasskeys(&stepUpPasskeys{})
 
-	keyActor := Identity{UserID: "u-1", OrgID: "org-1", Role: RoleAdmin, Scheme: SchemeAPIKey}
+	keyActor := Identity{UserID: "u-1", OrgID: "org-1", Role: testAdmin, Scheme: SchemeAPIKey}
 	if _, err := a.BeginStepUpWithPasskey(context.Background(), keyActor); !errors.Is(err, ErrStepUpRequired) {
 		t.Fatalf("BeginStepUpWithPasskey = %v, want ErrStepUpRequired", err)
 	}

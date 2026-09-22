@@ -157,7 +157,7 @@ func newWebAuthnFixture(t *testing.T) (*auth.WebAuthnService, *fakeWebAuthnStore
 	store := newFakeWebAuthnStore()
 	users := newFakeAdminStore()
 	users.users["u-1"] = auth.User{
-		ID: "u-1", OrgID: "org-1", Email: "person@example.com", Name: "A Person", Role: auth.RoleAdmin,
+		ID: "u-1", OrgID: "org-1", Email: "person@example.com", Name: "A Person", Role: testAdmin,
 	}
 	svc, err := auth.NewWebAuthnService(waConfig(), store, users, stubClock{waNow}, &stubIDs{})
 	require.NoError(t, err)
@@ -165,7 +165,7 @@ func newWebAuthnFixture(t *testing.T) (*auth.WebAuthnService, *fakeWebAuthnStore
 }
 
 func waActor() auth.Identity {
-	return auth.Identity{UserID: "u-1", OrgID: "org-1", Role: auth.RoleAdmin, Email: "person@example.com"}
+	return auth.Identity{UserID: "u-1", OrgID: "org-1", Role: testAdmin, Email: "person@example.com"}
 }
 
 // --- tests ------------------------------------------------------------------
@@ -190,6 +190,14 @@ func TestPasskeysAreOffWithoutARelyingParty(t *testing.T) {
 	noOrigins.RPOrigins = nil
 	_, err = auth.NewWebAuthnService(noOrigins, store, users, stubClock{waNow}, &stubIDs{})
 	assert.ErrorIs(t, err, auth.ErrWebAuthnUnavailable)
+
+	// RPDisplayName has no generic default: it is the name shown in the
+	// browser's own prompt, and there is no value this package could pick
+	// that would be right for someone else's deployment.
+	noDisplayName := waConfig()
+	noDisplayName.RPDisplayName = ""
+	_, err = auth.NewWebAuthnService(noDisplayName, store, users, stubClock{waNow}, &stubIDs{})
+	assert.Error(t, err)
 }
 
 // TestBeginRegistrationIssuesAChallengeTheBrowserCanUse.
@@ -644,7 +652,7 @@ func TestAKeyRegisteredToOneAccountCannotSignInAsAnother(t *testing.T) {
 	t.Parallel()
 
 	svc, _, users := newWebAuthnFixture(t)
-	users.users["u-2"] = auth.User{ID: "u-2", OrgID: "org-1", Email: "other@example.com", Role: auth.RoleAdmin}
+	users.users["u-2"] = auth.User{ID: "u-2", OrgID: "org-1", Email: "other@example.com", Role: testAdmin}
 	registerKey(t, svc, webauthntest.New(t), "Key")
 
 	// The other account has no credential at all, so there is no ceremony to
@@ -710,14 +718,6 @@ func TestNewWebAuthnServiceRequiresItsCollaborators(t *testing.T) {
 			assert.Error(t, tc.build())
 		})
 	}
-
-	// The display name is a string on somebody's phone, not a security
-	// parameter, so an empty one is defaulted rather than refused.
-	cfg := waConfig()
-	cfg.RPDisplayName = ""
-	svc, err := auth.NewWebAuthnService(cfg, store, users, stubClock{waNow}, &stubIDs{})
-	require.NoError(t, err)
-	assert.NotNil(t, svc)
 }
 
 // TestCredentialsListsWhatTheAccountHolds.
@@ -742,7 +742,7 @@ func TestAnUnknownAccountCannotStartACeremony(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _ := newWebAuthnFixture(t)
-	ghost := auth.Identity{UserID: "u-ghost", OrgID: "org-1", Role: auth.RoleAdmin}
+	ghost := auth.Identity{UserID: "u-ghost", OrgID: "org-1", Role: testAdmin}
 
 	_, err := svc.BeginRegistration(context.Background(), ghost)
 	assert.ErrorIs(t, err, auth.ErrNotFound)
@@ -850,7 +850,7 @@ func TestClearingAStrandedUsersFactorRemovesTheirSecurityKeysToo(t *testing.T) {
 	waStore.creds["c-1"] = auth.WebAuthnCredential{ID: "c-1", UserID: "u-1", Name: "Lost YubiKey"}
 	require.True(t, mfa.RequiresSecondFactor(context.Background(), "u-1"))
 
-	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: auth.RoleAdmin}
+	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 	target := auth.User{ID: "u-1", OrgID: "org-1", Email: "person@example.com"}
 	require.NoError(t, mfa.ClearFactorFor(context.Background(), admin, "u-1", target))
 
@@ -864,7 +864,7 @@ func TestClearingAFactorWithNoPasskeyServiceStillWorks(t *testing.T) {
 	t.Parallel()
 
 	mfa, _, _ := newMFAFixture(t)
-	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: auth.RoleAdmin}
+	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 	target := auth.User{ID: "u-1", OrgID: "org-1", Email: "person@example.com"}
 
 	assert.NoError(t, mfa.ClearFactorFor(context.Background(), admin, "u-1", target))
@@ -881,7 +881,7 @@ func TestAFailureToRemoveTheKeysIsReported(t *testing.T) {
 	mfa = mfa.WithPasskeys(waSvc)
 	waStore.revokeAllErr = errors.New("database is down")
 
-	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: auth.RoleAdmin}
+	admin := auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 	target := auth.User{ID: "u-1", OrgID: "org-1", Email: "person@example.com"}
 
 	assert.Error(t, mfa.ClearFactorFor(context.Background(), admin, "u-1", target))
@@ -1182,7 +1182,7 @@ func TestTheUserHandleDecidesWhoSignsIn(t *testing.T) {
 	// u-2's key.
 	second := webauthntest.New(t)
 	second.UserHandle = []byte("u-2")
-	other := auth.Identity{UserID: "u-2", OrgID: "org-1", Role: auth.RoleViewer, Email: "other@example.com"}
+	other := auth.Identity{UserID: "u-2", OrgID: "org-1", Role: testViewer, Email: "other@example.com"}
 	c, err := svc.BeginRegistration(context.Background(), other)
 	require.NoError(t, err)
 	_, err = svc.FinishRegistration(context.Background(), other, c.ChallengeID, "Second laptop",

@@ -21,7 +21,7 @@ import (
 // guard is not the thing every test trips over.
 func seedAdmin(t *testing.T, store *fakeAdminStore, id string) auth.User {
 	t.Helper()
-	u := auth.User{ID: id, OrgID: "org-1", Email: id + "@example.com", Role: auth.RoleAdmin}
+	u := auth.User{ID: id, OrgID: "org-1", Email: id + "@example.com", Role: testAdmin}
 	store.users[id] = u
 	return u
 }
@@ -35,7 +35,7 @@ func TestDeleteUserRemovesTheAccount(t *testing.T) {
 	seedUser(t, store, "u-target", goodPassword)
 	seedAdmin(t, store, "u-admin")
 
-	require.NoError(t, a.DeleteUser(context.Background(), adminActor(), "u-target"))
+	require.NoError(t, a.DeleteUser(context.Background(), adminActor(t), "u-target"))
 	assert.Equal(t, []string{"u-target"}, store.deleted)
 	assert.NotContains(t, store.users, "u-target")
 }
@@ -48,7 +48,7 @@ func TestDeleteUserRefusesTheLastAdministrator(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	seedUser(t, store, "u-target", goodPassword) // the only enabled admin
 
-	err := a.DeleteUser(context.Background(), adminActor(), "u-target")
+	err := a.DeleteUser(context.Background(), adminActor(t), "u-target")
 	assert.True(t, errors.Is(err, auth.ErrLastAdmin), "got %v", err)
 	assert.Empty(t, store.deleted)
 }
@@ -60,7 +60,7 @@ func TestDeleteUserRefusesYourOwnAccount(t *testing.T) {
 	seedAdmin(t, store, "u-admin")
 	seedAdmin(t, store, "u-other")
 
-	assert.Error(t, a.DeleteUser(context.Background(), adminActor(), "u-admin"))
+	assert.Error(t, a.DeleteUser(context.Background(), adminActor(t), "u-admin"))
 	assert.Empty(t, store.deleted)
 }
 
@@ -70,9 +70,9 @@ func TestDeleteUserRefusesAnotherOrganizationsAccount(t *testing.T) {
 	t.Parallel()
 
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	store.users["u-elsewhere"] = auth.User{ID: "u-elsewhere", OrgID: "org-2", Role: auth.RoleViewer}
+	store.users["u-elsewhere"] = auth.User{ID: "u-elsewhere", OrgID: "org-2", Role: testViewer}
 
-	err := a.DeleteUser(context.Background(), adminActor(), "u-elsewhere")
+	err := a.DeleteUser(context.Background(), adminActor(t), "u-elsewhere")
 	assert.True(t, errors.Is(err, auth.ErrNotFound), "got %v", err)
 	assert.Empty(t, store.deleted)
 }
@@ -82,7 +82,7 @@ func TestDeleteUserRefusesANonAdministrator(t *testing.T) {
 
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	seedUser(t, store, "u-target", goodPassword)
-	viewer := auth.Identity{UserID: "u-v", OrgID: "org-1", Role: auth.RoleViewer}
+	viewer := auth.Identity{UserID: "u-v", OrgID: "org-1", Role: testViewer}.WithPermissions(testTable(t))
 
 	err := a.DeleteUser(context.Background(), viewer, "u-target")
 	assert.True(t, errors.Is(err, auth.ErrNotPermitted), "got %v", err)
@@ -97,8 +97,8 @@ func TestSetRoleChangesTheRole(t *testing.T) {
 	seedUser(t, store, "u-target", goodPassword)
 	seedAdmin(t, store, "u-admin")
 
-	require.NoError(t, a.SetRole(context.Background(), adminActor(), "u-target", auth.RoleAnalyst))
-	assert.Equal(t, auth.RoleAnalyst, store.users["u-target"].Role)
+	require.NoError(t, a.SetRole(context.Background(), adminActor(t), "u-target", testAnalyst))
+	assert.Equal(t, testAnalyst, store.users["u-target"].Role)
 }
 
 func TestSetRoleRejectsAnUnknownRole(t *testing.T) {
@@ -107,8 +107,8 @@ func TestSetRoleRejectsAnUnknownRole(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	seedUser(t, store, "u-target", goodPassword)
 
-	assert.Error(t, a.SetRole(context.Background(), adminActor(), "u-target", auth.Role("superuser")))
-	assert.Equal(t, auth.RoleAdmin, store.users["u-target"].Role)
+	assert.Error(t, a.SetRole(context.Background(), adminActor(t), "u-target", auth.Role("superuser")))
+	assert.Equal(t, testAdmin, store.users["u-target"].Role)
 }
 
 // TestSetRoleToTheCurrentRoleIsANoOp — an idempotent call must not trip the
@@ -120,8 +120,8 @@ func TestSetRoleToTheCurrentRoleIsANoOp(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	seedUser(t, store, "u-target", goodPassword) // the only enabled admin
 
-	require.NoError(t, a.SetRole(context.Background(), adminActor(), "u-target", auth.RoleAdmin))
-	assert.Equal(t, auth.RoleAdmin, store.users["u-target"].Role)
+	require.NoError(t, a.SetRole(context.Background(), adminActor(t), "u-target", testAdmin))
+	assert.Equal(t, testAdmin, store.users["u-target"].Role)
 }
 
 // TestSetRoleRefusesDemotingTheLastAdministrator.
@@ -131,9 +131,9 @@ func TestSetRoleRefusesDemotingTheLastAdministrator(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	seedUser(t, store, "u-target", goodPassword)
 
-	err := a.SetRole(context.Background(), adminActor(), "u-target", auth.RoleViewer)
+	err := a.SetRole(context.Background(), adminActor(t), "u-target", testViewer)
 	assert.True(t, errors.Is(err, auth.ErrLastAdmin), "got %v", err)
-	assert.Equal(t, auth.RoleAdmin, store.users["u-target"].Role)
+	assert.Equal(t, testAdmin, store.users["u-target"].Role)
 }
 
 func TestSetRoleRefusesYourOwnAccount(t *testing.T) {
@@ -143,8 +143,8 @@ func TestSetRoleRefusesYourOwnAccount(t *testing.T) {
 	seedAdmin(t, store, "u-admin")
 	seedAdmin(t, store, "u-other")
 
-	assert.Error(t, a.SetRole(context.Background(), adminActor(), "u-admin", auth.RoleViewer))
-	assert.Equal(t, auth.RoleAdmin, store.users["u-admin"].Role)
+	assert.Error(t, a.SetRole(context.Background(), adminActor(t), "u-admin", testViewer))
+	assert.Equal(t, testAdmin, store.users["u-admin"].Role)
 }
 
 // --- API keys --------------------------------------------------------------
@@ -158,12 +158,12 @@ func TestMintAPIKeyClampsTheRoleToTheCallersOwn(t *testing.T) {
 	t.Parallel()
 
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	analyst := auth.Identity{UserID: "u-an", OrgID: "org-1", Role: auth.RoleAnalyst}
+	analyst := auth.Identity{UserID: "u-an", OrgID: "org-1", Role: testAnalyst}.WithPermissions(testTable(t))
 
-	_, info, err := a.MintAPIKey(context.Background(), analyst, "ci", auth.RoleAdmin)
+	_, info, err := a.MintAPIKey(context.Background(), analyst, "ci", testAdmin)
 	require.NoError(t, err)
-	assert.Equal(t, auth.RoleAnalyst, info.Role, "an analyst minted an admin key")
-	assert.Equal(t, auth.RoleAnalyst, store.keys[info.ID].Role)
+	assert.Equal(t, testAnalyst, info.Role, "an analyst minted an admin key")
+	assert.Equal(t, testAnalyst, store.keys[info.ID].Role)
 }
 
 func TestMintAPIKeyAllowsANarrowerRole(t *testing.T) {
@@ -171,9 +171,9 @@ func TestMintAPIKeyAllowsANarrowerRole(t *testing.T) {
 
 	a, _, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 
-	_, info, err := a.MintAPIKey(context.Background(), adminActor(), "read-only ci", auth.RoleViewer)
+	_, info, err := a.MintAPIKey(context.Background(), adminActor(t), "read-only ci", testViewer)
 	require.NoError(t, err)
-	assert.Equal(t, auth.RoleViewer, info.Role)
+	assert.Equal(t, testViewer, info.Role)
 }
 
 // TestMintAPIKeyFallsBackToTheCallersRole when the request names no valid one.
@@ -182,9 +182,9 @@ func TestMintAPIKeyFallsBackToTheCallersRole(t *testing.T) {
 
 	a, _, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 
-	_, info, err := a.MintAPIKey(context.Background(), adminActor(), "unnamed", auth.Role(""))
+	_, info, err := a.MintAPIKey(context.Background(), adminActor(t), "unnamed", auth.Role(""))
 	require.NoError(t, err)
-	assert.Equal(t, auth.RoleAdmin, info.Role)
+	assert.Equal(t, testAdmin, info.Role)
 }
 
 // TestMintAPIKeyReturnsTheKeyOnceAndStoresOnlyItsHash.
@@ -193,7 +193,7 @@ func TestMintAPIKeyReturnsTheKeyOnceAndStoresOnlyItsHash(t *testing.T) {
 
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 
-	key, info, err := a.MintAPIKey(context.Background(), adminActor(), "  ci  ", auth.RoleAdmin)
+	key, info, err := a.MintAPIKey(context.Background(), adminActor(t), "  ci  ", testAdmin)
 	require.NoError(t, err)
 	require.NotEmpty(t, key)
 	assert.Equal(t, "ci", info.Name, "the name was not trimmed")
@@ -206,7 +206,7 @@ func TestMintAPIKeyRefusesAnUnauthenticatedCaller(t *testing.T) {
 
 	a, _, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 
-	_, _, err := a.MintAPIKey(context.Background(), auth.Identity{}, "ci", auth.RoleAdmin)
+	_, _, err := a.MintAPIKey(context.Background(), auth.Identity{}, "ci", testAdmin)
 	assert.True(t, errors.Is(err, auth.ErrNotPermitted), "got %v", err)
 }
 
@@ -216,7 +216,7 @@ func TestMintAPIKeySurfacesAStoreFailureRatherThanTheKey(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	store.keyErr = errors.New("database is down")
 
-	key, _, err := a.MintAPIKey(context.Background(), adminActor(), "ci", auth.RoleAdmin)
+	key, _, err := a.MintAPIKey(context.Background(), adminActor(t), "ci", testAdmin)
 	require.Error(t, err)
 	assert.Empty(t, key, "a key that was never stored was handed to the caller")
 }
@@ -226,11 +226,11 @@ func TestListAPIKeysReturnsOnlyTheCallersOwn(t *testing.T) {
 	t.Parallel()
 
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	_, mine, err := a.MintAPIKey(context.Background(), adminActor(), "mine", auth.RoleAdmin)
+	_, mine, err := a.MintAPIKey(context.Background(), adminActor(t), "mine", testAdmin)
 	require.NoError(t, err)
 	store.keys["k-theirs"] = auth.APIKeyInfo{ID: "k-theirs", UserID: "u-someone-else"}
 
-	got, err := a.ListAPIKeys(context.Background(), adminActor())
+	got, err := a.ListAPIKeys(context.Background(), adminActor(t))
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, mine.ID, got[0].ID)
@@ -249,10 +249,10 @@ func TestRevokeAPIKeyStampsTheKey(t *testing.T) {
 	t.Parallel()
 
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	_, info, err := a.MintAPIKey(context.Background(), adminActor(), "ci", auth.RoleAdmin)
+	_, info, err := a.MintAPIKey(context.Background(), adminActor(t), "ci", testAdmin)
 	require.NoError(t, err)
 
-	require.NoError(t, a.RevokeAPIKey(context.Background(), adminActor(), info.ID))
+	require.NoError(t, a.RevokeAPIKey(context.Background(), adminActor(t), info.ID))
 	assert.True(t, store.keys[info.ID].Revoked())
 }
 
@@ -262,11 +262,11 @@ func TestRevokeAPIKeyIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	a, _, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	_, info, err := a.MintAPIKey(context.Background(), adminActor(), "ci", auth.RoleAdmin)
+	_, info, err := a.MintAPIKey(context.Background(), adminActor(t), "ci", testAdmin)
 	require.NoError(t, err)
 
-	require.NoError(t, a.RevokeAPIKey(context.Background(), adminActor(), info.ID))
-	assert.NoError(t, a.RevokeAPIKey(context.Background(), adminActor(), info.ID))
+	require.NoError(t, a.RevokeAPIKey(context.Background(), adminActor(t), info.ID))
+	assert.NoError(t, a.RevokeAPIKey(context.Background(), adminActor(t), info.ID))
 }
 
 // TestRevokeAPIKeyAnswersAsNotFoundForSomebodyElsesKey.
@@ -279,7 +279,7 @@ func TestRevokeAPIKeyAnswersAsNotFoundForSomebodyElsesKey(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	store.keys["k-theirs"] = auth.APIKeyInfo{ID: "k-theirs", UserID: "u-someone-else"}
 
-	err := a.RevokeAPIKey(context.Background(), adminActor(), "k-theirs")
+	err := a.RevokeAPIKey(context.Background(), adminActor(t), "k-theirs")
 	assert.True(t, errors.Is(err, auth.ErrNotFound), "got %v", err)
 	assert.False(t, store.keys["k-theirs"].Revoked(), "another caller's key was revoked")
 }
@@ -302,7 +302,7 @@ func TestPasswordPolicyIsReadableByAnyAuthenticatedCaller(t *testing.T) {
 	t.Parallel()
 
 	a, _, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	viewer := auth.Identity{UserID: "u-v", OrgID: "org-1", Role: auth.RoleViewer}
+	viewer := auth.Identity{UserID: "u-v", OrgID: "org-1", Role: testViewer}.WithPermissions(testTable(t))
 
 	p, err := a.PasswordPolicy(context.Background(), viewer)
 	require.NoError(t, err)
@@ -330,7 +330,7 @@ func TestSetPasswordPolicyTakesTheOrganizationFromTheCaller(t *testing.T) {
 	want := auth.DefaultPolicy("org-1")
 	want.OrgID = "org-2-belongs-to-someone-else"
 
-	got, err := a.SetPasswordPolicy(context.Background(), adminActor(), want)
+	got, err := a.SetPasswordPolicy(context.Background(), adminActor(t), want)
 	require.NoError(t, err)
 	assert.Equal(t, "org-1", got.OrgID)
 	require.Len(t, policies.saved, 1)
@@ -346,7 +346,7 @@ func TestSetPasswordPolicyStampsTheAuthorItself(t *testing.T) {
 	p := auth.DefaultPolicy("org-1")
 	p.UpdatedBy = "somebody.else@example.com"
 
-	got, err := a.SetPasswordPolicy(context.Background(), adminActor(), p)
+	got, err := a.SetPasswordPolicy(context.Background(), adminActor(t), p)
 	require.NoError(t, err)
 	assert.Equal(t, "admin@example.com", got.UpdatedBy)
 	assert.Equal(t, "admin@example.com", policies.saved[0].UpdatedBy)
@@ -357,7 +357,7 @@ func TestSetPasswordPolicyRefusesANonAdministrator(t *testing.T) {
 	t.Parallel()
 
 	a, _, policies := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	viewer := auth.Identity{UserID: "u-v", OrgID: "org-1", Role: auth.RoleViewer}
+	viewer := auth.Identity{UserID: "u-v", OrgID: "org-1", Role: testViewer}.WithPermissions(testTable(t))
 
 	_, err := a.SetPasswordPolicy(context.Background(), viewer, auth.DefaultPolicy("org-1"))
 	assert.True(t, errors.Is(err, auth.ErrNotPermitted), "got %v", err)
@@ -372,7 +372,7 @@ func TestSetPasswordPolicyRejectsAnInvalidPolicy(t *testing.T) {
 	p := auth.DefaultPolicy("org-1")
 	p.MinLength = 2
 
-	_, err := a.SetPasswordPolicy(context.Background(), adminActor(), p)
+	_, err := a.SetPasswordPolicy(context.Background(), adminActor(t), p)
 	assert.Error(t, err)
 	assert.Empty(t, policies.saved, "an invalid policy reached the store")
 }
@@ -383,10 +383,10 @@ func TestSetPasswordPolicyNeedsAPolicyStore(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeAdminStore()
-	a, err := auth.NewAdmin(store, stubClock{}, &stubIDs{})
+	a, err := auth.NewAdmin(store, stubClock{}, &stubIDs{}, testTable(t))
 	require.NoError(t, err)
 
-	_, err = a.SetPasswordPolicy(context.Background(), adminActor(), auth.DefaultPolicy("org-1"))
+	_, err = a.SetPasswordPolicy(context.Background(), adminActor(t), auth.DefaultPolicy("org-1"))
 	assert.True(t, errors.Is(err, auth.ErrNoPolicyStore), "got %v", err)
 }
 
@@ -396,6 +396,6 @@ func TestSetPasswordPolicySurfacesAStoreFailure(t *testing.T) {
 	a, _, policies := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	policies.saveErr = errors.New("database is down")
 
-	_, err := a.SetPasswordPolicy(context.Background(), adminActor(), auth.DefaultPolicy("org-1"))
+	_, err := a.SetPasswordPolicy(context.Background(), adminActor(t), auth.DefaultPolicy("org-1"))
 	assert.Error(t, err)
 }

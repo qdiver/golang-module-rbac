@@ -164,7 +164,7 @@ var testNow = time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 
 func newTestAuthenticator(t *testing.T, store Store) *Authenticator {
 	t.Helper()
-	a, err := NewAuthenticator(store, fixedClock{testNow}, &seqIDs{})
+	a, err := NewAuthenticator(store, fixedClock{testNow}, &seqIDs{}, testTable(t))
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
@@ -178,12 +178,14 @@ func TestNewAuthenticatorRequiresEverything(t *testing.T) {
 		store Store
 		clock Clock
 		ids   IDGen
+		table *PermissionTable
 	}{
-		{"no store", nil, fixedClock{testNow}, &seqIDs{}},
-		{"no clock", newFakeStore(), nil, &seqIDs{}},
-		{"no ids", newFakeStore(), fixedClock{testNow}, nil},
+		{"no store", nil, fixedClock{testNow}, &seqIDs{}, testTable(t)},
+		{"no clock", newFakeStore(), nil, &seqIDs{}, testTable(t)},
+		{"no ids", newFakeStore(), fixedClock{testNow}, nil, testTable(t)},
+		{"no table", newFakeStore(), fixedClock{testNow}, &seqIDs{}, nil},
 	} {
-		if _, err := NewAuthenticator(tc.store, tc.clock, tc.ids); err == nil {
+		if _, err := NewAuthenticator(tc.store, tc.clock, tc.ids, tc.table); err == nil {
 			t.Errorf("%s: NewAuthenticator succeeded, want an error", tc.name)
 		}
 	}
@@ -197,7 +199,7 @@ func TestLoginMintsASessionOnTheRightClocks(t *testing.T) {
 	store := newFakeStore()
 	store.withUser(t, User{
 		ID: "u1", OrgID: "org-1", Email: "Ada@Example.com",
-		Name: "Ada Lovelace", Role: RoleAnalyst,
+		Name: "Ada Lovelace", Role: testAnalyst,
 	}, "correct-horse-battery")
 	a := newTestAuthenticator(t, store)
 
@@ -210,7 +212,7 @@ func TestLoginMintsASessionOnTheRightClocks(t *testing.T) {
 	if token == "" {
 		t.Fatal("Login returned no token")
 	}
-	if id.UserID != "u1" || id.OrgID != "org-1" || id.Role != RoleAnalyst {
+	if id.UserID != "u1" || id.OrgID != "org-1" || id.Role != testAnalyst {
 		t.Errorf("identity = %+v, want u1/org-1/analyst", id)
 	}
 	if id.Scheme != SchemeSession {
@@ -247,11 +249,11 @@ func TestLoginFailuresAreOneError(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeStore()
-	store.withUser(t, User{ID: "u1", Email: "real@example.com", Role: RoleViewer}, "the-right-password")
-	store.withUser(t, User{ID: "u2", Email: "gone@example.com", Role: RoleViewer, Disabled: true}, "the-right-password")
+	store.withUser(t, User{ID: "u1", Email: "real@example.com", Role: testViewer}, "the-right-password")
+	store.withUser(t, User{ID: "u2", Email: "gone@example.com", Role: testViewer, Disabled: true}, "the-right-password")
 	// An account with no password at all — an OIDC-shaped row, once that
 	// exists. No password is the right one for it.
-	store.withUser(t, User{ID: "u3", Email: "sso@example.com", Role: RoleViewer}, "")
+	store.withUser(t, User{ID: "u3", Email: "sso@example.com", Role: testViewer}, "")
 	a := newTestAuthenticator(t, store)
 
 	for _, tc := range []struct{ name, email, password string }{
@@ -284,7 +286,7 @@ func TestLoginUpgradesAWeakHash(t *testing.T) {
 
 	store := newFakeStore()
 	store.users["old@example.com"] = User{
-		ID: "u1", Email: "old@example.com", Role: RoleViewer,
+		ID: "u1", Email: "old@example.com", Role: testViewer,
 		// Written under far weaker parameters than this build uses.
 		PasswordHash: weakHash(t, "still-the-right-password"),
 	}
@@ -334,7 +336,7 @@ func TestLoginSurvivesAFailedRehash(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeStore()
-	store.withUser(t, User{ID: "u1", Email: "a@example.com", Role: RoleViewer}, "the-right-password")
+	store.withUser(t, User{ID: "u1", Email: "a@example.com", Role: testViewer}, "the-right-password")
 	a := newTestAuthenticator(t, store)
 
 	if _, err := a.Login(t.Context(), "a@example.com", "the-right-password"); err != nil {
@@ -370,7 +372,7 @@ func TestAuthenticateSession(t *testing.T) {
 	}
 	store.sessions[string(hash)] = SessionLookup{
 		SessionID: "s1",
-		Identity:  Identity{UserID: "u1", OrgID: "org-1", Role: RoleAdmin, Scheme: SchemeSession},
+		Identity:  Identity{UserID: "u1", OrgID: "org-1", Role: testAdmin, Scheme: SchemeSession},
 	}
 	a := newTestAuthenticator(t, store)
 
@@ -379,7 +381,7 @@ func TestAuthenticateSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AuthenticateSession: %v", err)
 		}
-		if id.UserID != "u1" || id.Role != RoleAdmin {
+		if id.UserID != "u1" || id.Role != testAdmin {
 			t.Errorf("identity = %+v", id)
 		}
 		if len(store.touched) == 0 || store.touched[len(store.touched)-1] != "s1" {
@@ -420,7 +422,7 @@ func TestAuthenticateAPIKey(t *testing.T) {
 	}
 	store.keys[string(hash)] = APIKeyLookup{
 		KeyID:    "k1",
-		Identity: Identity{UserID: "u1", OrgID: "org-1", Role: RoleViewer, Scheme: SchemeAPIKey},
+		Identity: Identity{UserID: "u1", OrgID: "org-1", Role: testViewer, Scheme: SchemeAPIKey},
 	}
 	a := newTestAuthenticator(t, store)
 
@@ -430,7 +432,7 @@ func TestAuthenticateAPIKey(t *testing.T) {
 	}
 	// The KEY's role, not its owner's — it was clamped at mint time, so
 	// nothing downstream needs to consult the owner to be safe.
-	if id.Role != RoleViewer {
+	if id.Role != testViewer {
 		t.Errorf("role = %q, want the key's own viewer", id.Role)
 	}
 	if len(store.touched) == 0 || store.touched[len(store.touched)-1] != "k1" {
@@ -482,8 +484,8 @@ func TestLogout(t *testing.T) {
 // organization of the report it is processing, never an inherited caller's.
 func TestSystemIdentityIsAdminWithinOneOrg(t *testing.T) {
 	t.Parallel()
-	id := SystemIdentity("org-9")
-	if !id.Can(PermDeleteReport) {
+	id := SystemIdentity("org-9", testTable(t))
+	if !id.Can(testPermDelete) {
 		t.Error("the worker cannot act on the reports it processes")
 	}
 	if id.OrgID != "org-9" {

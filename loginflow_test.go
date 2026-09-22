@@ -123,7 +123,7 @@ func loginFixture(t *testing.T) (*Authenticator, *fakeStore, *stepFactor) {
 	t.Helper()
 	store := newFakeStore()
 	store.withUser(t, User{
-		ID: "u-1", OrgID: "org-1", Email: "person@example.com", Role: RoleAdmin,
+		ID: "u-1", OrgID: "org-1", Email: "person@example.com", Role: testAdmin,
 	}, stepUpPassword)
 
 	factor := &stepFactor{token: "step-one-token", verifyKind: FactorTOTP}

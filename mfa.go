@@ -100,6 +100,7 @@ type MFAService struct {
 	clock  Clock
 	ids    IDGen
 	issuer string
+	table  *PermissionTable
 
 	// passkeys lets a security key count as a second factor (ADR-0031).
 	// Optional; see WithPasskeys.
@@ -107,19 +108,21 @@ type MFAService struct {
 }
 
 // NewMFAService builds the service. Every dependency is required: a second
-// factor with no sealer would store its secret in plaintext, and one with no
-// store would report itself enabled and verify nothing.
-func NewMFAService(store MFAStore, users AdminStore, sealer *Sealer, clock Clock, ids IDGen, issuer string) (*MFAService, error) {
-	if store == nil || users == nil || clock == nil || ids == nil {
-		return nil, errors.New("auth: NewMFAService requires a store, a user store, a clock and an ID generator")
+// factor with no sealer would store its secret in plaintext, one with no
+// store would report itself enabled and verify nothing, and issuer is the
+// name every enrolled authenticator app shows next to the account — there
+// is no generic default that would be right for someone else's deployment.
+func NewMFAService(store MFAStore, users AdminStore, sealer *Sealer, clock Clock, ids IDGen, issuer string, table *PermissionTable) (*MFAService, error) {
+	if store == nil || users == nil || clock == nil || ids == nil || table == nil {
+		return nil, errors.New("auth: NewMFAService requires a store, a user store, a clock, an ID generator and a permission table")
 	}
 	if sealer == nil {
 		return nil, ErrNoSealKey
 	}
 	if issuer == "" {
-		issuer = "Security Assessment"
+		return nil, errors.New("auth: NewMFAService requires an issuer name")
 	}
-	return &MFAService{store: store, users: users, sealer: sealer, clock: clock, ids: ids, issuer: issuer}, nil
+	return &MFAService{store: store, users: users, sealer: sealer, clock: clock, ids: ids, issuer: issuer, table: table}, nil
 }
 
 // Status describes an account's second factor for its owner.
@@ -347,16 +350,16 @@ func (m *MFAService) Disable(ctx context.Context, actor Identity, currentPasswor
 // covers the case where the codes are gone too, which is common enough that
 // without it the honest advice would be "do not enable this".
 //
-// The caller must hold PermManageUsers and the target must be in their
-// organization — manageableTarget enforces both. It deliberately does NOT
-// require the administrator's own password: they may be acting on an urgent
-// call, and an administrator who can already reset this account's password
-// and sign in as them gains nothing from the extra step.
+// The caller must hold the ManageUsers permission and the target must be
+// in their organization — manageableTarget enforces both. It deliberately
+// does NOT require the administrator's own password: they may be acting on
+// an urgent call, and an administrator who can already reset this
+// account's password and sign in as them gains nothing from the extra step.
 //
 // The recovery codes go with the factor, for the same reason Disable takes
 // them: they exist only to get past it.
 func (m *MFAService) ClearFactorFor(ctx context.Context, actor Identity, userID string, target User) error {
-	if !actor.Can(PermManageUsers) {
+	if !actor.Can(m.table.ManageUsers) {
 		return ErrNotPermitted
 	}
 	if target.OrgID != actor.OrgID {

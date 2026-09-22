@@ -162,17 +162,15 @@ func NewWebAuthnService(cfg WebAuthnConfig, store WebAuthnStore, users WebAuthnU
 	if strings.TrimSpace(cfg.RPID) == "" || len(cfg.RPOrigins) == 0 {
 		return nil, ErrWebAuthnUnavailable
 	}
+	if strings.TrimSpace(cfg.RPDisplayName) == "" {
+		return nil, errors.New("auth: NewWebAuthnService requires RPDisplayName — the name shown in the browser's passkey prompt, and there is no generic default that would be right for someone else's deployment")
+	}
 	if store == nil || users == nil || clock == nil || ids == nil {
 		return nil, errors.New("auth: NewWebAuthnService requires a store, a user store, a clock and an ID generator")
 	}
 
-	name := cfg.RPDisplayName
-	if name == "" {
-		name = "Security Assessment"
-	}
-
 	wa, err := webauthn.New(&webauthn.Config{
-		RPDisplayName: name,
+		RPDisplayName: cfg.RPDisplayName,
 		RPID:          cfg.RPID,
 		RPOrigins:     cfg.RPOrigins,
 		AuthenticatorSelection: protocol.AuthenticatorSelection{

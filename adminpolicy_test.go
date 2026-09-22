@@ -239,24 +239,62 @@ const (
 	otherPassword = "Marrow-Kestrel-4-Plinth"
 )
 
+// Test fixtures for the role/permission mechanism, shared across this
+// package's (auth_test) test files. See auth_test.go's own copy (package
+// auth) for why this package defines its own role/permission vocabulary
+// rather than importing one from the library.
+const (
+	testViewer  auth.Role = "viewer"
+	testAnalyst auth.Role = "analyst"
+	testAdmin   auth.Role = "admin"
+
+	testPermRead    auth.Permission = "reports:read"
+	testPermCreate  auth.Permission = "reports:create"
+	testPermRerun   auth.Permission = "reports:rerun"
+	testPermDelete  auth.Permission = "reports:delete"
+	testPermDispute auth.Permission = "disputes:manage"
+	testPermUsers   auth.Permission = "users:manage"
+)
+
+func testTable(t *testing.T) *auth.PermissionTable {
+	t.Helper()
+	table, err := auth.NewPermissionTable(map[auth.Role][]auth.Permission{
+		testViewer: {testPermRead},
+		testAnalyst: {
+			testPermRead, testPermCreate, testPermRerun, testPermDispute,
+		},
+		testAdmin: {
+			testPermRead, testPermCreate, testPermRerun,
+			testPermDelete, testPermDispute, testPermUsers,
+		},
+	}, testPermUsers, testAdmin)
+	if err != nil {
+		t.Fatalf("build test permission table: %v", err)
+	}
+	return table
+}
+
 func newAdminFixture(t *testing.T, policy auth.Policy) (*auth.Admin, *fakeAdminStore, *fakePolicyStore) {
 	t.Helper()
 	store := newFakeAdminStore()
 	policies := &fakePolicyStore{policy: policy, history: map[string][]string{}}
-	a, err := auth.NewAdmin(store, stubClock{time.Date(2026, 9, 18, 0, 0, 0, 0, time.UTC)}, &stubIDs{})
+	a, err := auth.NewAdmin(store, stubClock{time.Date(2026, 9, 18, 0, 0, 0, 0, time.UTC)}, &stubIDs{}, testTable(t))
 	require.NoError(t, err)
 	return a.WithPolicies(policies), store, policies
 }
 
-func adminActor() auth.Identity {
-	return auth.Identity{UserID: "u-admin", OrgID: "org-1", Role: auth.RoleAdmin, Actor: "admin@example.com"}
+func adminActor(t *testing.T) auth.Identity {
+	t.Helper()
+	return auth.Identity{
+		UserID: "u-admin", OrgID: "org-1", Role: testAdmin, Actor: "admin@example.com",
+	}.WithPermissions(testTable(t))
 }
 
 func seedUser(t *testing.T, store *fakeAdminStore, id, password string) auth.User {
 	t.Helper()
 	hash, err := auth.HashPassword(password)
 	require.NoError(t, err)
-	u := auth.User{ID: id, OrgID: "org-1", Email: id + "@example.com", Name: "Test", PasswordHash: hash, Role: auth.RoleAdmin}
+	u := auth.User{ID: id, OrgID: "org-1", Email: id + "@example.com", Name: "Test", PasswordHash: hash, Role: testAdmin}
 	store.users[id] = u
 	return u
 }
@@ -270,8 +308,8 @@ func TestCreateUserAppliesTheOrganizationPolicy(t *testing.T) {
 	t.Parallel()
 
 	a, _, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	_, err := a.CreateUser(context.Background(), adminActor(),
-		"new@example.com", "New Person", auth.RoleViewer, "all-lower-case-and-long")
+	_, err := a.CreateUser(context.Background(), adminActor(t),
+		"new@example.com", "New Person", testViewer, "all-lower-case-and-long")
 
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, auth.ErrWeakPassword))
@@ -285,8 +323,8 @@ func TestCreateUserRefusesAPasswordContainingTheNewAccountsOwnDetails(t *testing
 	t.Parallel()
 
 	a, _, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	_, err := a.CreateUser(context.Background(), adminActor(),
-		"bernard@example.com", "Bernard Quill", auth.RoleViewer, "Bernard-9-Thicket!")
+	_, err := a.CreateUser(context.Background(), adminActor(t),
+		"bernard@example.com", "Bernard Quill", testViewer, "Bernard-9-Thicket!")
 
 	assert.Contains(t, rulesOf(t, err), auth.RulePersonal)
 }
@@ -296,7 +334,7 @@ func TestChangePasswordAppliesThePolicyAndRecordsTheChange(t *testing.T) {
 
 	a, store, policies := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	u := seedUser(t, store, "u-1", goodPassword)
-	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: auth.RoleAdmin}
+	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 
 	require.NoError(t, a.ChangePassword(context.Background(), actor, goodPassword, otherPassword))
 
@@ -320,7 +358,7 @@ func TestTheCurrentPasswordIsVerifiedBeforeTheNewOneIsJudged(t *testing.T) {
 
 	a, store, policies := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	u := seedUser(t, store, "u-1", goodPassword)
-	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: auth.RoleAdmin}
+	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 
 	err := a.ChangePassword(context.Background(), actor, "the-wrong-current", "weak")
 
@@ -337,7 +375,7 @@ func TestReuseIsRefused(t *testing.T) {
 
 	a, store, policies := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	u := seedUser(t, store, "u-1", goodPassword)
-	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: auth.RoleAdmin}
+	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 
 	oldHash, err := auth.HashPassword(otherPassword)
 	require.NoError(t, err)
@@ -357,7 +395,7 @@ func TestReuseIsNotCheckedUntilTheCheapRulesPass(t *testing.T) {
 
 	a, store, policies := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	u := seedUser(t, store, "u-1", goodPassword)
-	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: auth.RoleAdmin}
+	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 
 	// Reading history at all would be the bug, so the fake fails loudly if
 	// it is touched.
@@ -378,7 +416,7 @@ func TestHistoryDepthZeroSkipsTheCheckEntirely(t *testing.T) {
 	p.HistoryDepth = 0
 	a, store, policies := newAdminFixture(t, p)
 	u := seedUser(t, store, "u-1", goodPassword)
-	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: auth.RoleAdmin}
+	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 
 	policies.historyErr = errors.New("history must not be read when the depth is zero")
 	require.NoError(t, a.ChangePassword(context.Background(), actor, goodPassword, otherPassword))
@@ -399,7 +437,7 @@ func TestResetPasswordAlsoRefusesReuse(t *testing.T) {
 	require.NoError(t, err)
 	policies.history[target.ID] = []string{oldHash}
 
-	err = a.ResetPassword(context.Background(), adminActor(), target.ID, otherPassword)
+	err = a.ResetPassword(context.Background(), adminActor(t), target.ID, otherPassword)
 	require.Error(t, err)
 	assert.Contains(t, rulesOf(t, err), auth.RuleReuse)
 }
@@ -410,11 +448,11 @@ func TestAMissingPolicyStoreFallsBackToTheDefaults(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeAdminStore()
-	a, err := auth.NewAdmin(store, stubClock{time.Now()}, &stubIDs{})
+	a, err := auth.NewAdmin(store, stubClock{time.Now()}, &stubIDs{}, testTable(t))
 	require.NoError(t, err)
 
-	_, err = a.CreateUser(context.Background(), adminActor(),
-		"new@example.com", "New", auth.RoleViewer, "all-lower-case-and-long")
+	_, err = a.CreateUser(context.Background(), adminActor(t),
+		"new@example.com", "New", testViewer, "all-lower-case-and-long")
 	require.Error(t, err, "a password store-less Admin accepted a password the default policy refuses")
 	assert.Contains(t, rulesOf(t, err), auth.RuleUppercase)
 }
@@ -428,8 +466,8 @@ func TestAPolicyReadFailureFallsBackToTheDefaults(t *testing.T) {
 	a, _, policies := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	policies.readErr = errors.New("database unavailable")
 
-	_, err := a.CreateUser(context.Background(), adminActor(),
-		"new@example.com", "New", auth.RoleViewer, "all-lower-case-and-long")
+	_, err := a.CreateUser(context.Background(), adminActor(t),
+		"new@example.com", "New", testViewer, "all-lower-case-and-long")
 	require.Error(t, err)
 	assert.Contains(t, rulesOf(t, err), auth.RuleUppercase)
 }
@@ -443,7 +481,7 @@ func TestAFailureToRecordTheChangeIsReported(t *testing.T) {
 
 	a, store, policies := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	u := seedUser(t, store, "u-1", goodPassword)
-	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: auth.RoleAdmin}
+	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 	policies.recordErr = errors.New("history table unavailable")
 
 	err := a.ChangePassword(context.Background(), actor, goodPassword, otherPassword)
@@ -462,7 +500,7 @@ func TestChangePasswordLiftsTheRotationHold(t *testing.T) {
 
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	u := seedUser(t, store, "u-1", goodPassword)
-	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: auth.RoleAdmin, PasswordExpired: true}
+	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: testAdmin, PasswordExpired: true}.WithPermissions(testTable(t))
 
 	require.NoError(t, a.ChangePassword(context.Background(), actor, goodPassword, otherPassword))
 	assert.Contains(t, store.clearedExpiry, u.ID,
@@ -478,7 +516,7 @@ func TestAFailureToLiftTheHoldIsReported(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	u := seedUser(t, store, "u-1", goodPassword)
 	store.clearExpiryErr = errors.New("sessions table unavailable")
-	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: auth.RoleAdmin}
+	actor := auth.Identity{UserID: u.ID, OrgID: "org-1", Role: testAdmin}.WithPermissions(testTable(t))
 
 	err := a.ChangePassword(context.Background(), actor, goodPassword, otherPassword)
 	require.ErrorContains(t, err, "rotation hold")
@@ -499,10 +537,10 @@ func TestDisableThenEnableRoundTrips(t *testing.T) {
 	seedUser(t, store, "u-keeper", goodPassword)
 	target := seedUser(t, store, "u-2", goodPassword)
 
-	require.NoError(t, a.DisableUser(context.Background(), adminActor(), target.ID))
+	require.NoError(t, a.DisableUser(context.Background(), adminActor(t), target.ID))
 	assert.True(t, store.users[target.ID].Disabled, "the account was not disabled")
 
-	require.NoError(t, a.EnableUser(context.Background(), adminActor(), target.ID))
+	require.NoError(t, a.EnableUser(context.Background(), adminActor(t), target.ID))
 	assert.False(t, store.users[target.ID].Disabled, "the account could not be re-enabled")
 }
 
@@ -515,7 +553,7 @@ func TestEnablingAnAlreadyEnabledUserIsANoOp(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	target := seedUser(t, store, "u-2", goodPassword)
 
-	require.NoError(t, a.EnableUser(context.Background(), adminActor(), target.ID))
+	require.NoError(t, a.EnableUser(context.Background(), adminActor(t), target.ID))
 	assert.False(t, store.users[target.ID].Disabled)
 }
 
@@ -527,10 +565,10 @@ func TestEnableUserNeedsTheManagementPermission(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	target := seedUser(t, store, "u-2", goodPassword)
 	store.users[target.ID] = auth.User{
-		ID: target.ID, OrgID: "org-1", Email: target.Email, Role: auth.RoleViewer, Disabled: true,
+		ID: target.ID, OrgID: "org-1", Email: target.Email, Role: testViewer, Disabled: true,
 	}
 
-	analyst := auth.Identity{UserID: "u-analyst", OrgID: "org-1", Role: auth.RoleAnalyst}
+	analyst := auth.Identity{UserID: "u-analyst", OrgID: "org-1", Role: testAnalyst}.WithPermissions(testTable(t))
 	err := a.EnableUser(context.Background(), analyst, target.ID)
 	assert.ErrorIs(t, err, auth.ErrNotPermitted)
 	assert.True(t, store.users[target.ID].Disabled, "a non-manager re-enabled an account")
@@ -545,10 +583,10 @@ func TestEnableUserCannotReachAnotherOrganization(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	store.users["u-other"] = auth.User{
 		ID: "u-other", OrgID: "org-2", Email: "other@example.com",
-		Role: auth.RoleViewer, Disabled: true,
+		Role: testViewer, Disabled: true,
 	}
 
-	err := a.EnableUser(context.Background(), adminActor(), "u-other")
+	err := a.EnableUser(context.Background(), adminActor(t), "u-other")
 	require.Error(t, err, "an administrator re-enabled an account in another organization")
 	assert.True(t, store.users["u-other"].Disabled)
 }
@@ -564,10 +602,10 @@ func TestListUsersIsScopedToTheCallersOrganization(t *testing.T) {
 	a, store, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
 	seedUser(t, store, "u-ours", goodPassword)
 	store.users["u-theirs"] = auth.User{
-		ID: "u-theirs", OrgID: "org-2", Email: "neighbour@example.com", Role: auth.RoleAdmin,
+		ID: "u-theirs", OrgID: "org-2", Email: "neighbour@example.com", Role: testAdmin,
 	}
 
-	got, err := a.ListUsers(context.Background(), adminActor())
+	got, err := a.ListUsers(context.Background(), adminActor(t))
 	require.NoError(t, err)
 	for _, u := range got {
 		assert.Equal(t, "org-1", u.OrgID, "the listing reached into another organization")
@@ -578,7 +616,7 @@ func TestListUsersNeedsTheManagementPermission(t *testing.T) {
 	t.Parallel()
 
 	a, _, _ := newAdminFixture(t, auth.DefaultPolicy("org-1"))
-	analyst := auth.Identity{UserID: "u-analyst", OrgID: "org-1", Role: auth.RoleAnalyst}
+	analyst := auth.Identity{UserID: "u-analyst", OrgID: "org-1", Role: testAnalyst}.WithPermissions(testTable(t))
 
 	_, err := a.ListUsers(context.Background(), analyst)
 	assert.ErrorIs(t, err, auth.ErrNotPermitted)

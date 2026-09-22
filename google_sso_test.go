@@ -57,7 +57,7 @@ func googleLoginFixture(t *testing.T) (*Authenticator, *fakeStore, *stepGoogle) 
 	t.Helper()
 	store := newFakeStore()
 	store.withUser(t, User{
-		ID: "u-1", OrgID: "org-1", Email: "person@example.com", Role: RoleAdmin,
+		ID: "u-1", OrgID: "org-1", Email: "person@example.com", Role: testAdmin,
 	}, "")
 
 	g := &stepGoogle{finishFor: "u-1"}

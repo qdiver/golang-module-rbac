@@ -93,31 +93,57 @@ type Identity struct {
 	// forces a change rather than signing someone out into a form they
 	// cannot reach.
 	PasswordExpired bool
+
+	// perms is the table Can checks Role against. Unexported so nothing
+	// outside this package can forge one onto an Identity it did not build
+	// — WithPermissions is how a caller outside this package attaches one.
+	perms *PermissionTable
 }
 
-// Can reports whether this identity may perform the operation.
+// WithPermissions returns a copy of i that answers Can against t.
 //
-// The zero Identity carries the zero Role, which is not a valid role and so
-// carries no permissions. That is the property that makes a missed
-// authentication step fail closed: an unauthenticated request whose identity
-// was never populated can do nothing, rather than defaulting into whatever
-// the first role in a table happens to be.
-func (i Identity) Can(p Permission) bool { return i.Role.Can(p) }
+// identityOf, IdentityOf and SystemIdentity all call this internally, so
+// anything produced by this package's own login path already carries the
+// table it was configured with. This is for the other case: code outside
+// this package that builds an Identity by hand — a login stub in a test, a
+// synthetic identity for a background job the application drives itself —
+// needs a way to attach the deployment's table too, since the field itself
+// cannot be set from outside the package.
+func (i Identity) WithPermissions(t *PermissionTable) Identity {
+	i.perms = t
+	return i
+}
 
-// SystemIdentity returns the identity the worker acts under for a given
-// organization.
+// Can reports whether this identity may perform the operation, against the
+// PermissionTable it was built with.
+//
+// The zero Identity carries the zero Role and a nil table, neither of which
+// matches anything in a real PermissionTable. That is the property that
+// makes a missed authentication step fail closed: an unauthenticated
+// request whose identity was never populated can do nothing, rather than
+// defaulting into whatever the first role in a table happens to be.
+func (i Identity) Can(p Permission) bool { return i.perms.Can(i.Role, p) }
+
+// SystemIdentity returns the identity a background job acts under for a
+// given organization, carrying t's AdminRole — the same role's authority an
+// operator would have, since a job doing work on an organization's behalf
+// needs to do anything an administrator of that organization could.
 //
 // The org is a parameter rather than a constant because a background job
-// acts within the organization of the report it is processing — never an
-// inherited caller's, and never "all of them". ADR-0027 is explicit that
-// rescore and the deep pass carry the report's org.
-func SystemIdentity(orgID string) Identity {
+// acts within the organization of the work it is processing — never an
+// inherited caller's, and never "all of them".
+//
+// t must not be nil; it is the same table passed to NewAuthenticator and
+// NewAdmin, and a process that reaches this without one configured has a
+// wiring bug worth panicking over rather than silently granting a system
+// job zero permissions.
+func SystemIdentity(orgID string, t *PermissionTable) Identity {
 	return Identity{
 		OrgID:  orgID,
-		Role:   RoleAdmin,
+		Role:   t.AdminRole,
 		Actor:  "system",
 		Scheme: SchemeSystem,
-	}
+	}.WithPermissions(t)
 }
 
 // identityKey is the context key for the authenticated caller. It is an

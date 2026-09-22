@@ -28,7 +28,7 @@ import auth "github.com/qdiver/golang-module-rbac"
 
 | Concern | Type | File |
 |---|---|---|
-| Roles and permissions | `Role`, `Permission`, `Role.Can` | `role.go` |
+| Roles and permissions | `PermissionTable`, `Role`, `Permission` | `role.go` |
 | Request identity | `Identity`, `WithIdentity`/`FromContext` | `identity.go` |
 | Password hashing | `HashPassword`, `VerifyPassword` (argon2id) | `password.go` |
 | Password policy | `Policy`, `Policy.Check`, `PolicyStore` | `policy.go` |
@@ -46,37 +46,78 @@ import auth "github.com/qdiver/golang-module-rbac"
 
 ## Roles and permissions
 
-Three fixed roles — `RoleViewer`, `RoleAnalyst`, `RoleAdmin` — each mapped to
-an explicit set of permissions in a table (`role.go`), not an ordered
-hierarchy:
+This module defines no roles or permissions of its own — `Role` and
+`Permission` are plain string types, and your project names both however
+fits its own domain:
 
 ```go
 const (
-	PermReadReports    Permission = "reports:read"
-	PermCreateReport   Permission = "reports:create"
-	PermRerunReport    Permission = "reports:rerun"
-	PermDeleteReport   Permission = "reports:delete"
-	PermManageDisputes Permission = "disputes:manage"
-	PermManageUsers    Permission = "users:manage"
+	RoleViewer auth.Role = "viewer"
+	RoleEditor auth.Role = "editor"
+	RoleOwner  auth.Role = "owner"
+
+	PermReadPost    auth.Permission = "posts:read"
+	PermWritePost   auth.Permission = "posts:write"
+	PermPublish     auth.Permission = "posts:publish"
+	PermManageUsers auth.Permission = "users:manage"
 )
 ```
 
-Roles are a string type, not an integer, and deliberately unordered: a
-hierarchy invites `if role >= Analyst`, which silently grants every future
-role inserted above that comparison point whatever it was guarding. Every
-authorization decision goes through `Role.Can(perm)` against the table, so
-adding a role or a permission can't accidentally widen an existing check.
-
-The permission names describe operations ("create a report"), not routes
-("POST /reports"), so moving or versioning a route doesn't silently change
-who may call it. The permission set above matches the product this module
-was extracted from — treat it as a starting point and edit `role.go` to fit
-your own domain's operations.
+You declare which role carries which permissions once, in a
+`PermissionTable`, built at startup and passed to `NewAuthenticator`,
+`NewAdmin` and `NewMFAService`:
 
 ```go
-if !actor.Can(auth.PermDeleteReport) {
+table, err := auth.NewPermissionTable(map[auth.Role][]auth.Permission{
+	RoleViewer: {PermReadPost},
+	RoleEditor: {PermReadPost, PermWritePost},
+	RoleOwner:  {PermReadPost, PermWritePost, PermPublish, PermManageUsers},
+}, PermManageUsers, RoleOwner)
+```
+
+Each role repeats what a weaker one grants rather than inheriting from it —
+the duplication is the point, so the table reads top to bottom with no
+inheritance chain to walk, and a permission can be given to one role alone
+without anyone having to notice a weaker role's set feeds into it. Roles are
+a string type, not an integer, and deliberately unordered: an integer
+hierarchy invites `if role >= editor`, which silently grants every future
+role inserted above that comparison point whatever it was guarding.
+
+The last two arguments to `NewPermissionTable` name the two things this
+module's own machinery depends on: `ManageUsers` is the permission that
+gates `Admin`'s account-management operations (`CreateUser`, `SetRole`,
+`MintAPIKey`, ...) and `MFAService.ClearFactorFor`, and the admin role is
+who the last-enabled-administrator safety check protects — the one every
+organization must keep at least one enabled instance of — and who
+`SystemIdentity` acts as. Construction fails if the admin role doesn't
+actually carry the `ManageUsers` permission in your table, since that
+combination can never do anything useful.
+
+Every authorization decision goes through `Can`, most often via the
+`Identity` it was resolved against:
+
+```go
+if !actor.Can(PermPublish) {
 	return auth.ErrNotPermitted
 }
+```
+
+### How the table reaches `Can`
+
+`identity.Can(perm)` takes no table argument — the table travels inside the
+`Identity`, attached once by whichever `Authenticator`/`Admin`/etc. resolved
+it, from the same `*PermissionTable` you built at startup. A zero-value or
+never-authenticated `Identity` carries no table and so `Can` returns `false`
+for everything, which is what makes a missed authentication step fail
+closed rather than defaulting into whatever the first role in a table
+happens to be.
+
+Code outside this module that builds an `Identity` by hand — a login stub in
+a test, a synthetic identity for a background job your application drives
+itself — attaches the table explicitly:
+
+```go
+actor := auth.Identity{UserID: id, OrgID: orgID, Role: RoleEditor}.WithPermissions(table)
 ```
 
 ## Wiring it up
@@ -89,7 +130,7 @@ store := myPostgresIdentityStore{} // implements auth.Store
 clock := realClock{}               // implements auth.Clock: Now() time.Time
 ids := uuidGen{}                   // implements auth.IDGen: NewID() string
 
-authenticator, err := auth.NewAuthenticator(store, clock, ids)
+authenticator, err := auth.NewAuthenticator(store, clock, ids, table)
 if err != nil {
 	log.Fatal(err)
 }
@@ -118,9 +159,9 @@ separate `AdminStore` interface, specifically so that request-path code
 enforced by the type system, not by convention:
 
 ```go
-admin, err := auth.NewAdmin(adminStore, clock, ids)
+admin, err := auth.NewAdmin(adminStore, clock, ids, table)
 ...
-user, err := admin.CreateUser(ctx, actor, email, name, auth.RoleAnalyst, password)
+user, err := admin.CreateUser(ctx, actor, email, name, RoleEditor, password)
 ```
 
 ### Store interfaces to implement
@@ -173,8 +214,8 @@ salted hash (`token.go`):
   forgotten tab on a shared machine times out and a stolen cookie has a
   bounded life no matter how actively it's used.
 - **API keys** — long-lived, minted by an admin via `Admin.MintAPIKey`, and
-  clamped to at most the minting admin's own role (`Role.AtMost`) so an
-  admin can never mint a key with more authority than they hold.
+  clamped to at most the minting admin's own role (`PermissionTable.AtMost`)
+  so an admin can never mint a key with more authority than they hold.
 
 ## MFA and passkeys
 
@@ -285,5 +326,5 @@ the application wiring this module in.
   resolves it to an `Identity`, and denies a route the caller's role can't
   reach). That pattern is generic enough to reuse, but the concrete
   route-to-permission table is application policy, not library code —
-  wire `Role.Can` / `Identity.Can` into your own router's middleware.
+  wire `Identity.Can` into your own router's middleware.
 - **Concrete storage adapters** (Postgres, etc.) for the interfaces above.
