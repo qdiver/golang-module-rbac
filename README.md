@@ -2,8 +2,8 @@
 
 An identity and access-control control plane for Go HTTP services: password
 and session authentication, API keys, role/permission authorization, MFA
-(TOTP + recovery codes), WebAuthn/passkeys, step-up re-verification, and a
-configurable password policy.
+(TOTP + recovery codes), WebAuthn/passkeys, Google Sign-In (OpenID Connect),
+step-up re-verification, and a configurable password policy.
 
 It was extracted verbatim from a product's `internal/infra/auth` package, so
 it ships as a working, tested unit rather than a from-scratch library. It is
@@ -39,6 +39,7 @@ import auth "github.com/qdiver/golang-module-rbac"
 | TOTP second factor | `MFAService`, `MFAStore`, TOTP helpers | `mfa.go`, `totp.go` |
 | Recovery codes | `NewRecoveryCodes`, `NormalizeRecoveryCode` | `recovery.go` |
 | WebAuthn / passkeys | `WebAuthnService`, `WebAuthnStore` | `webauthn.go` |
+| Google Sign-In (OIDC) | `GoogleSSOService`, `GoogleSSOStore` | `google_sso.go` |
 | Step-up re-authentication | `Authenticator.StepUp`, `StepUpStore` | `stepup.go` |
 | Secret-at-rest sealing | `Sealer` (AES-GCM) | `seal.go` |
 | Test fixtures | `webauthntest` package | `webauthntest/` |
@@ -131,6 +132,7 @@ user, err := admin.CreateUser(ctx, actor, email, name, auth.RoleAnalyst, passwor
 | `PolicyStore` | per-org password policy | `policy.go` |
 | `MFAStore` | TOTP enrollment, MFA tokens, recovery codes | `mfa.go` |
 | `WebAuthnStore` | passkey credentials and ceremony challenges | `webauthn.go` |
+| `GoogleSSOStore` | linked Google accounts and sign-in state | `google_sso.go` |
 | `StepUpStore` | step-up timestamps | `stepup.go` |
 
 Every lookup method is expected to return `auth.ErrNotFound` for "no live
@@ -186,6 +188,61 @@ salted hash (`token.go`):
   by password or by passkey — for actions that shouldn't ride on however
   old the session already is.
 
+## Google Sign-In (SSO)
+
+`GoogleSSOService` (`google_sso.go`) adds Google as an alternative first
+factor beside a password, using standard OAuth 2.0 + OpenID Connect
+(authorization code flow, with PKCE):
+
+```go
+google, err := auth.NewGoogleSSOService(ctx, auth.GoogleSSOConfig{
+	ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+	ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+	RedirectURL:  "https://app.example.com/auth/google/callback",
+	// HostedDomain: "example.com", // optional: restrict to a Workspace domain
+}, googleStore, store, clock, ids)
+if err != nil {
+	log.Fatal(err)
+}
+authenticator = authenticator.WithGoogleSSO(google)
+```
+
+Two endpoints drive it:
+
+```go
+// GET /auth/google
+start, err := authenticator.BeginGoogleLogin(ctx)
+// redirect the browser to start.RedirectURL; remember nothing else — the
+// state and PKCE verifier are already persisted by GoogleSSOStore.
+
+// GET /auth/google/callback?state=...&code=...
+result, err := authenticator.CompleteGoogleLogin(ctx, r.URL.Query().Get("state"), r.URL.Query().Get("code"))
+// handled exactly like authenticator.Login's result: check MFARequired(),
+// or set result.SessionToken as the session cookie.
+```
+
+A few decisions worth knowing about before wiring this in:
+
+- **It does not skip the account's own second factor.** Unlike a passkey —
+  which cryptographically proves possession of specific hardware and
+  (per `WebAuthnConfig`) typically user verification — a Google sign-in only
+  proves the browser currently holds a live Google session, which this
+  package treats as no stronger than a password. `CompleteGoogleLogin`
+  consults `RequiresSecondFactor` exactly like `Login` does.
+- **It never creates an account.** The first time a Google account signs in,
+  `GoogleSSOService` links it to an existing user by a Google-verified email
+  match (`email_verified` must be true) and persists that link via
+  `GoogleSSOStore.LinkGoogleAccount` for next time. If no account matches,
+  it returns `auth.ErrGoogleAccountNotFound` rather than provisioning one —
+  which organization a new user belongs to and what role they start with are
+  deployment policy, the same reasoning that keeps `AdminStore.CreateUser`
+  behind an authenticated, permitted actor. Handle that error by
+  provisioning through `Admin.CreateUser` yourself, if self-service sign-up
+  is what you want, and let the caller retry.
+- **`HostedDomain`**, when set, refuses any Google account outside that
+  Google Workspace domain (the ID token's `hd` claim) — useful for an
+  internal tool that should only ever accept a company's own accounts.
+
 ## Password policy
 
 `Policy` (`policy.go`) is a per-organization, data-driven set of rules
@@ -201,7 +258,10 @@ carrying every violated rule, not just the first one.
 go test ./...
 ```
 
-The suite is self-contained — no database or network access required. The
+The suite is self-contained — no database or network access required,
+including for Google SSO: those tests run `GoogleSSOService` against a local
+token endpoint and a self-signed test key pair rather than Google's own
+infrastructure (`oidc.NewVerifier`'s documented pattern for this). The
 `webauthntest` package provides an in-memory fake WebAuthn authenticator for
 exercising registration/login ceremonies in tests without a real security
 key.
@@ -210,6 +270,8 @@ key.
 
 - `golang.org/x/crypto` — argon2id password hashing
 - `github.com/go-webauthn/webauthn` — WebAuthn/passkey ceremonies
+- `github.com/coreos/go-oidc/v3` + `golang.org/x/oauth2` — Google Sign-In
+  (OpenID Connect discovery, token exchange, ID token verification)
 - `github.com/pquerna/otp` — TOTP
 - `github.com/stretchr/testify` — test assertions
 - `github.com/fxamacker/cbor/v2` — used by the `webauthntest` fixture

@@ -70,6 +70,11 @@ type Authenticator struct {
 	// with none, an account's keys cannot finish a sign-in and TOTP is the
 	// only second step.
 	passkeys PasskeyAuthenticator
+
+	// google completes a sign-in with a Google account. Optional: with
+	// none, BeginGoogleLogin and CompleteGoogleLogin answer
+	// ErrGoogleSSOUnavailable and password is the only first factor.
+	google GoogleAuthenticator
 }
 
 // PasskeyAuthenticator is the part of the passkey use cases the login path
@@ -92,6 +97,18 @@ type PasskeyAuthenticator interface {
 	// credential the browser offers.
 	BeginPasswordlessLogin(ctx context.Context) (Ceremony, error)
 	FinishPasswordlessLogin(ctx context.Context, challengeID string, response []byte) (userID string, err error)
+}
+
+// GoogleAuthenticator is the part of the Google sign-in use cases the login
+// path needs.
+//
+// Two methods, mirroring PasskeyAuthenticator's front door: start a sign-in
+// that names no account, and finish one. Linking, which account a fresh
+// Google sign-in resolves to, and the OAuth mechanics all stay inside
+// GoogleSSOService — this is only what the login path calls.
+type GoogleAuthenticator interface {
+	BeginLogin(ctx context.Context) (GoogleLoginStart, error)
+	FinishLogin(ctx context.Context, state, code string) (userID string, err error)
 }
 
 // SecondFactor is the part of the MFA use cases the login path needs.
@@ -411,6 +428,66 @@ func (a *Authenticator) CompletePasskeyLogin(ctx context.Context, challengeID st
 		return LoginResult{}, ErrInvalidCredentials
 	}
 	return a.issueSession(ctx, u, a.clock.Now(), FactorPasskey)
+}
+
+// WithGoogleSSO attaches the Google sign-in use cases, enabling a Google
+// account to complete a login.
+func (a *Authenticator) WithGoogleSSO(g GoogleAuthenticator) *Authenticator {
+	a.google = g
+	return a
+}
+
+// BeginGoogleLogin starts a sign-in with a Google account.
+//
+// Like BeginPasswordlessLogin, it takes no credential and names no account:
+// which account it turns out to be is decided entirely by which Google
+// account the browser authenticates as.
+func (a *Authenticator) BeginGoogleLogin(ctx context.Context) (GoogleLoginStart, error) {
+	if a.google == nil {
+		return GoogleLoginStart{}, ErrGoogleSSOUnavailable
+	}
+	return a.google.BeginLogin(ctx)
+}
+
+// CompleteGoogleLogin verifies the callback and mints a session.
+//
+// Unlike CompletePasswordlessLogin, this DOES consult RequiresSecondFactor:
+// see the package doc in google_sso.go for why a Google sign-in is treated
+// as a first factor, not as proof strong enough to skip the account's own
+// second one. The account is re-read here for the same reason every other
+// completion re-reads it: it may have been disabled since the redirect
+// began, and a suspension that only took effect at the next login would be
+// no suspension at all.
+func (a *Authenticator) CompleteGoogleLogin(ctx context.Context, state, code string) (LoginResult, error) {
+	if a.google == nil {
+		return LoginResult{}, ErrGoogleSSOUnavailable
+	}
+	now := a.clock.Now()
+
+	userID, err := a.google.FinishLogin(ctx, state, code)
+	if err != nil {
+		return LoginResult{}, err
+	}
+
+	u, err := a.store.UserByID(ctx, userID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return LoginResult{}, ErrInvalidCredentials
+	case err != nil:
+		return LoginResult{}, fmt.Errorf("auth: look up user: %w", err)
+	case u.Disabled:
+		return LoginResult{}, ErrInvalidCredentials
+	}
+
+	if a.factor != nil && a.factor.RequiresSecondFactor(ctx, u.ID) {
+		mfaToken, mfaErr := a.factor.IssueMFAToken(ctx, u.ID)
+		if mfaErr != nil {
+			return LoginResult{}, fmt.Errorf("auth: begin second factor: %w", mfaErr)
+		}
+		return LoginResult{MFAToken: mfaToken, Identity: identityOf(u, SchemeSession)}, nil
+	}
+
+	return a.issueSession(ctx, u, now, FactorGoogle)
 }
 
 // WithStepUp attaches the store that records step-up re-verifications.
