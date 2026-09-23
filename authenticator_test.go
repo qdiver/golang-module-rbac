@@ -28,11 +28,12 @@ type fakeStore struct {
 	sessions map[string]SessionLookup
 	keys     map[string]APIKeyLookup
 
-	inserted []NewSession
-	touched  []string
-	revoked  []string
-	rehashed map[string]string
-	failWith error
+	inserted      []NewSession
+	touched       []string
+	touchedExpiry time.Time
+	revoked       []string
+	rehashed      map[string]string
+	failWith      error
 }
 
 // clearedExpiry records ClearPasswordExpired calls, so a test can assert the
@@ -116,8 +117,9 @@ func (f *fakeStore) SessionByTokenHash(_ context.Context, hash []byte, _ time.Ti
 	return got, nil
 }
 
-func (f *fakeStore) TouchSession(_ context.Context, id string, _, _ time.Time) error {
+func (f *fakeStore) TouchSession(_ context.Context, id string, _, expiresAt time.Time) error {
 	f.touched = append(f.touched, id)
+	f.touchedExpiry = expiresAt
 	return nil
 }
 
@@ -491,4 +493,110 @@ func TestSystemIdentityIsAdminWithinOneOrg(t *testing.T) {
 	if id.OrgID != "org-9" {
 		t.Errorf("OrgID = %q", id.OrgID)
 	}
+}
+
+func TestSessionLifetimesAreDecidedPerUser(t *testing.T) {
+	t.Parallel()
+
+	// Administrators get the short windows, everyone else the long ones.
+	byRole := func(u User) (idle, absolute time.Duration) {
+		if u.Role == testAdmin {
+			return 5 * time.Minute, 8 * time.Hour
+		}
+		return 10 * time.Minute, 12 * time.Hour
+	}
+
+	t.Run("issue uses the rule", func(t *testing.T) {
+		store := newFakeStore()
+		store.withUser(t, User{ID: "u1", OrgID: "org-1", Email: "root@example.com", Role: testAdmin}, "pw")
+		a := newTestAuthenticator(t, store).WithSessionLifetimes(byRole)
+
+		if _, err := a.Login(t.Context(), "root@example.com", "pw"); err != nil {
+			t.Fatalf("Login: %v", err)
+		}
+		got := store.inserted[0]
+		if want := testNow.Add(5 * time.Minute); !got.ExpiresAt.Equal(want) {
+			t.Errorf("idle expiry = %s, want %s", got.ExpiresAt, want)
+		}
+		if want := testNow.Add(8 * time.Hour); !got.AbsoluteExpiresAt.Equal(want) {
+			t.Errorf("absolute expiry = %s, want %s", got.AbsoluteExpiresAt, want)
+		}
+	})
+
+	t.Run("touch uses the rule, on the session's own role", func(t *testing.T) {
+		store := newFakeStore()
+		token, hash, err := NewSessionToken()
+		if err != nil {
+			t.Fatalf("NewSessionToken: %v", err)
+		}
+		store.sessions[string(hash)] = SessionLookup{
+			SessionID: "s1",
+			Identity:  Identity{UserID: "u2", OrgID: "org-1", Role: testAnalyst, Scheme: SchemeSession},
+		}
+		a := newTestAuthenticator(t, store).WithSessionLifetimes(byRole)
+
+		if _, err := a.AuthenticateSession(t.Context(), token); err != nil {
+			t.Fatalf("AuthenticateSession: %v", err)
+		}
+		if want := testNow.Add(10 * time.Minute); !store.touchedExpiry.Equal(want) {
+			t.Errorf("touched idle expiry = %s, want %s", store.touchedExpiry, want)
+		}
+	})
+
+	t.Run("the rule sees who the session belongs to", func(t *testing.T) {
+		store := newFakeStore()
+		token, hash, err := NewSessionToken()
+		if err != nil {
+			t.Fatalf("NewSessionToken: %v", err)
+		}
+		store.sessions[string(hash)] = SessionLookup{
+			SessionID: "s1",
+			Identity:  Identity{UserID: "u2", OrgID: "org-1", Email: "a@example.com", Actor: "Ada", Role: testAnalyst},
+		}
+		var seen User
+		a := newTestAuthenticator(t, store).WithSessionLifetimes(func(u User) (time.Duration, time.Duration) {
+			seen = u
+			return 0, 0
+		})
+		if _, err := a.AuthenticateSession(t.Context(), token); err != nil {
+			t.Fatalf("AuthenticateSession: %v", err)
+		}
+		want := User{ID: "u2", OrgID: "org-1", Email: "a@example.com", Name: "Ada", Role: testAnalyst}
+		if seen != want {
+			t.Errorf("rule saw %+v, want %+v", seen, want)
+		}
+	})
+
+	t.Run("zero falls back to the defaults", func(t *testing.T) {
+		store := newFakeStore()
+		store.withUser(t, User{ID: "u1", OrgID: "org-1", Email: "x@example.com", Role: testViewer}, "pw")
+		a := newTestAuthenticator(t, store).WithSessionLifetimes(func(User) (time.Duration, time.Duration) { return 0, -1 })
+
+		if _, err := a.Login(t.Context(), "x@example.com", "pw"); err != nil {
+			t.Fatalf("Login: %v", err)
+		}
+		got := store.inserted[0]
+		if want := testNow.Add(IdleTimeout); !got.ExpiresAt.Equal(want) {
+			t.Errorf("idle expiry = %s, want default %s", got.ExpiresAt, want)
+		}
+		if want := testNow.Add(AbsoluteTimeout); !got.AbsoluteExpiresAt.Equal(want) {
+			t.Errorf("absolute expiry = %s, want default %s", got.AbsoluteExpiresAt, want)
+		}
+	})
+
+	t.Run("a ceiling below the idle window is raised to meet it", func(t *testing.T) {
+		store := newFakeStore()
+		store.withUser(t, User{ID: "u1", OrgID: "org-1", Email: "x@example.com", Role: testViewer}, "pw")
+		a := newTestAuthenticator(t, store).WithSessionLifetimes(func(User) (time.Duration, time.Duration) {
+			return time.Hour, time.Minute
+		})
+
+		if _, err := a.Login(t.Context(), "x@example.com", "pw"); err != nil {
+			t.Fatalf("Login: %v", err)
+		}
+		got := store.inserted[0]
+		if !got.AbsoluteExpiresAt.Equal(got.ExpiresAt) {
+			t.Errorf("absolute = %s, idle = %s; the ceiling should have been raised to the idle window", got.AbsoluteExpiresAt, got.ExpiresAt)
+		}
+	})
 }

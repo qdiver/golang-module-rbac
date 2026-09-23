@@ -212,7 +212,10 @@ salted hash (`token.go`):
 - **Sessions** — cookie-carried, with an idle timeout and a hard absolute
   ceiling (`IdleTimeout`, `AbsoluteTimeout` in `authenticator.go`), so a
   forgotten tab on a shared machine times out and a stolen cookie has a
-  bounded life no matter how actively it's used.
+  bounded life no matter how actively it's used. Those are the defaults;
+  `Authenticator.WithSessionLifetimes` takes a `func(User) (idle, absolute
+  time.Duration)` so a deployment can give administrators a shorter idle
+  window than agents. It's consulted at issue and on every touch.
 - **API keys** — long-lived, minted by an admin via `Admin.MintAPIKey`, and
   clamped to at most the minting admin's own role (`PermissionTable.AtMost`)
   so an admin can never mint a key with more authority than they hold.

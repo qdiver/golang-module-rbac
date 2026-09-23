@@ -15,10 +15,18 @@ import (
 // day, so a stolen cookie has a bounded life no matter how actively it is
 // exercised. A single sliding window would give the first property and not
 // the second — which is the one that matters after a token is exfiltrated.
+//
+// These are the defaults. A deployment that wants the windows to depend on
+// who the user is — shorter for an administrator than for an agent, say —
+// supplies its own rule with WithSessionLifetimes.
 const (
 	IdleTimeout     = 12 * time.Hour
 	AbsoluteTimeout = 7 * 24 * time.Hour
 )
+
+// SessionLifetimes decides the idle window and the absolute ceiling for one
+// user's sessions. See WithSessionLifetimes for the contract.
+type SessionLifetimes func(u User) (idle, absolute time.Duration)
 
 // ErrInvalidCredentials is returned by Login for every failure a caller is
 // allowed to distinguish: no such user, wrong password, disabled account.
@@ -76,6 +84,10 @@ type Authenticator struct {
 	// none, BeginGoogleLogin and CompleteGoogleLogin answer
 	// ErrGoogleSSOUnavailable and password is the only first factor.
 	google GoogleAuthenticator
+
+	// lifetimes decides the session windows per user. Optional: with none,
+	// every session gets IdleTimeout and AbsoluteTimeout.
+	lifetimes SessionLifetimes
 }
 
 // PasskeyAuthenticator is the part of the passkey use cases the login path
@@ -273,13 +285,15 @@ func (a *Authenticator) issueSession(ctx context.Context, u User, now time.Time,
 	// Middleware confines the session until the password is changed.
 	expired := a.passwordExpired(ctx, u, now)
 
+	idle, absolute := a.sessionLifetimes(u)
+
 	if err := a.store.InsertSession(ctx, NewSession{
 		ID:                a.ids.NewID(),
 		UserID:            u.ID,
 		TokenHash:         hash,
 		CreatedAt:         now,
-		ExpiresAt:         now.Add(IdleTimeout),
-		AbsoluteExpiresAt: now.Add(AbsoluteTimeout),
+		ExpiresAt:         now.Add(idle),
+		AbsoluteExpiresAt: now.Add(absolute),
 		PasswordExpired:   expired,
 	}); err != nil {
 		return LoginResult{}, fmt.Errorf("auth: persist session: %w", err)
@@ -589,8 +603,62 @@ func (a *Authenticator) AuthenticateSession(ctx context.Context, token string) (
 	//nolint:errcheck // best-effort: a failure to extend the idle window
 	// must not reject a request that authenticated correctly. The cost of
 	// losing it is an earlier re-login, which is the safe direction.
-	_ = a.store.TouchSession(ctx, got.SessionID, now, now.Add(IdleTimeout))
+	idle, _ := a.sessionLifetimes(userOf(got.Identity))
+	_ = a.store.TouchSession(ctx, got.SessionID, now, now.Add(idle))
 	return got.Identity, nil
+}
+
+// WithSessionLifetimes attaches a rule that decides, per user, how long a
+// session may sit idle and how long it may live in total.
+//
+// The rule is consulted when a session is issued and again on every touch,
+// so a change of role takes effect on the user's next request rather than
+// at their next login. It is handed the user the session belongs to; on a
+// touch that user is rebuilt from the session's Identity, so ID, OrgID,
+// Email, Name and Role are populated and the credential fields are not.
+// A rule should decide on Role and nothing else.
+//
+// A window the rule returns as zero or negative falls back to the package
+// default for that window, and an absolute ceiling shorter than the idle
+// window is raised to meet it — a ceiling below the idle window would
+// bound nothing, which is the single-clock failure ADR-0027 exists to rule
+// out. A nil rule restores the defaults.
+func (a *Authenticator) WithSessionLifetimes(f SessionLifetimes) *Authenticator {
+	a.lifetimes = f
+	return a
+}
+
+// sessionLifetimes answers the windows for one user, applying the fallbacks
+// WithSessionLifetimes documents.
+func (a *Authenticator) sessionLifetimes(u User) (idle, absolute time.Duration) {
+	idle, absolute = IdleTimeout, AbsoluteTimeout
+	if a.lifetimes == nil {
+		return idle, absolute
+	}
+	i, abs := a.lifetimes(u)
+	if i > 0 {
+		idle = i
+	}
+	if abs > 0 {
+		absolute = abs
+	}
+	if absolute < idle {
+		absolute = idle
+	}
+	return idle, absolute
+}
+
+// userOf is the inverse of identityOf, as far as it can be: the account
+// fields a session lookup carries, and none of the credential fields, which
+// no lifetime rule has any business reading.
+func userOf(id Identity) User {
+	return User{
+		ID:    id.UserID,
+		OrgID: id.OrgID,
+		Email: id.Email,
+		Name:  id.Actor,
+		Role:  id.Role,
+	}
 }
 
 // AuthenticateAPIKey resolves an X-API-Key value to an Identity.
