@@ -19,6 +19,7 @@ type User struct {
 	PasswordHash string
 	Role         Role
 	Disabled     bool
+	AvatarURL    string // profile picture URL from a Google sign-in, if any
 
 	// PasswordChangedAt is when the current password was set, or the zero
 	// time for an account that predates migration 0013.

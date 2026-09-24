@@ -204,6 +204,7 @@ func TestCompleteGoogleLoginPropagatesTheServicesError(t *testing.T) {
 // fakeGoogleStore is an in-memory GoogleSSOStore.
 type fakeGoogleStore struct {
 	links      map[string]string // subject -> userID
+	avatars    map[string]string // userID -> avatar URL
 	challenges map[string]googleChallenge
 	linkErr    error
 }
@@ -231,6 +232,14 @@ func (f *fakeGoogleStore) LinkGoogleAccount(_ context.Context, userID, subject s
 		return f.linkErr
 	}
 	f.links[subject] = userID
+	return nil
+}
+
+func (f *fakeGoogleStore) SetAvatarURL(_ context.Context, userID, url string, _ time.Time) error {
+	if f.avatars == nil {
+		f.avatars = map[string]string{}
+	}
+	f.avatars[userID] = url
 	return nil
 }
 

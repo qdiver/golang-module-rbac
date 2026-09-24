@@ -718,6 +718,7 @@ func identityOf(u User, scheme Scheme, table *PermissionTable) Identity {
 		Role:   u.Role,
 		Actor:  actor,
 		Email:  u.Email,
+		AvatarURL: u.AvatarURL,
 		Scheme: scheme,
 	}.WithPermissions(table)
 }

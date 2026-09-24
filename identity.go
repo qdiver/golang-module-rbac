@@ -68,6 +68,9 @@ type Identity struct {
 	// address they typed) and vanished on the next reload.
 	Email string
 
+	// AvatarURL is the profile picture from a Google sign-in, empty otherwise.
+	AvatarURL string
+
 	// Scheme records how the caller authenticated.
 	Scheme Scheme
 
