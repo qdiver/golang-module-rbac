@@ -466,10 +466,10 @@ func (a *Authenticator) BeginGoogleLogin(ctx context.Context) (GoogleLoginStart,
 
 // CompleteGoogleLogin verifies the callback and mints a session.
 //
-// Unlike CompletePasswordlessLogin, this DOES consult RequiresSecondFactor:
-// see the package doc in google_sso.go for why a Google sign-in is treated
-// as a first factor, not as proof strong enough to skip the account's own
-// second one. The account is re-read here for the same reason every other
+// Like CompletePasswordlessLogin, and unlike Login, this does NOT consult
+// RequiresSecondFactor: a Google sign-in completes the login by itself. See
+// the package doc in google_sso.go for the reasoning and the trade it
+// makes. The account is re-read here for the same reason every other
 // completion re-reads it: it may have been disabled since the redirect
 // began, and a suspension that only took effect at the next login would be
 // no suspension at all.
@@ -477,7 +477,6 @@ func (a *Authenticator) CompleteGoogleLogin(ctx context.Context, state, code str
 	if a.google == nil {
 		return LoginResult{}, ErrGoogleSSOUnavailable
 	}
-	now := a.clock.Now()
 
 	userID, err := a.google.FinishLogin(ctx, state, code)
 	if err != nil {
@@ -494,15 +493,7 @@ func (a *Authenticator) CompleteGoogleLogin(ctx context.Context, state, code str
 		return LoginResult{}, ErrInvalidCredentials
 	}
 
-	if a.factor != nil && a.factor.RequiresSecondFactor(ctx, u.ID) {
-		mfaToken, mfaErr := a.factor.IssueMFAToken(ctx, u.ID)
-		if mfaErr != nil {
-			return LoginResult{}, fmt.Errorf("auth: begin second factor: %w", mfaErr)
-		}
-		return LoginResult{MFAToken: mfaToken, Identity: identityOf(u, SchemeSession, a.table)}, nil
-	}
-
-	return a.issueSession(ctx, u, now, FactorGoogle)
+	return a.issueSession(ctx, u, a.clock.Now(), FactorGoogle)
 }
 
 // WithStepUp attaches the store that records step-up re-verifications.

@@ -13,20 +13,28 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Google Sign-In (OpenID Connect), as an alternative first factor beside a
-// password. It ships in the same shape as passkeys and TOTP: a separate
-// service, held by the Authenticator through a narrow interface, wired in
-// only when a deployment configures it (WithGoogleSSO).
+// Google Sign-In (OpenID Connect), as an alternative to a password. It
+// ships in the same shape as passkeys and TOTP: a separate service, held by
+// the Authenticator through a narrow interface, wired in only when a
+// deployment configures it (WithGoogleSSO).
 //
-// It is deliberately NOT treated as satisfying the account's own second
-// factor. A passkey ceremony proves possession of specific hardware and
-// (per WebAuthnConfig) typically user verification, which is why
-// CompletePasswordlessLogin skips RequiresSecondFactor. A Google sign-in
-// proves only that the browser currently holds a live Google session —
-// which, from this package's point of view, is a bearer credential no
-// stronger than a password. So it is treated as exactly that: a stand-in
-// for the password step, still gated by whatever second factor the account
-// has configured here.
+// A Google sign-in completes the login on its own: CompleteGoogleLogin does
+// NOT consult the account's second factor, the same treatment
+// CompletePasswordlessLogin gives a passkey. The reasoning is that the
+// second step already happened, at Google. A Google account, and a Workspace
+// account in particular, carries Google's own 2-Step Verification, and
+// asking the user for a six-digit code from this package on top of it is a
+// second prompt for the same proof — the kind of friction that pushes people
+// toward the password path this exists to replace. What this package
+// verifies is a signed ID token bound to the nonce this sign-in started
+// with, for a Google-verified email, in the hosted domain the deployment
+// allows; it does not treat the browser's Google session as a password.
+//
+// The trade that buys is that the strength of a Google login here is the
+// strength of the Google account. A deployment that wants every sign-in
+// behind a second factor of its own must either enforce 2-Step Verification
+// at Google (a Workspace admin policy, which HostedDomain makes the relevant
+// one) or not enable this at all.
 
 // GoogleChallengeLifetime is how long a sign-in may take between the
 // redirect to Google and the callback.

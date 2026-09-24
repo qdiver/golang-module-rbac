@@ -119,11 +119,11 @@ func TestCompleteGoogleLoginIssuesTheSessionAndRecordsTheFactor(t *testing.T) {
 	}
 }
 
-// TestCompleteGoogleLoginStopsAtTheChallengeWhenAFactorIsRequired mirrors
-// TestLoginStopsAtTheChallengeWhenAFactorIsRequired: a Google sign-in is
-// treated as a first factor, not as something strong enough to bypass the
-// account's own second one.
-func TestCompleteGoogleLoginStopsAtTheChallengeWhenAFactorIsRequired(t *testing.T) {
+// TestCompleteGoogleLoginDoesNotAskForASecondFactor is the counterpart of
+// TestLoginStopsAtTheChallengeWhenAFactorIsRequired: a Google sign-in
+// completes the login on its own, as a passkey does, because the second
+// step already happened at Google (see the package doc in google_sso.go).
+func TestCompleteGoogleLoginDoesNotAskForASecondFactor(t *testing.T) {
 	t.Parallel()
 
 	a, store, _ := googleLoginFixture(t)
@@ -134,14 +134,17 @@ func TestCompleteGoogleLoginStopsAtTheChallengeWhenAFactorIsRequired(t *testing.
 	if err != nil {
 		t.Fatalf("CompleteGoogleLogin: %v", err)
 	}
-	if !res.MFARequired() {
-		t.Fatal("a Google sign-in skipped the account's second factor")
+	if res.MFARequired() {
+		t.Fatal("a Google sign-in was sent to the account's second factor")
 	}
-	if res.SessionToken != "" {
-		t.Error("a session was issued before the second factor")
+	if res.SessionToken == "" {
+		t.Error("no session was issued")
 	}
-	if len(store.inserted) != 0 {
-		t.Error("a session row was written before the second factor")
+	if len(store.inserted) != 1 {
+		t.Errorf("persisted %d sessions, want 1", len(store.inserted))
+	}
+	if res.FactorUsed != FactorGoogle {
+		t.Errorf("FactorUsed = %q, want %q", res.FactorUsed, FactorGoogle)
 	}
 }
 

@@ -234,9 +234,9 @@ salted hash (`token.go`):
 
 ## Google Sign-In (SSO)
 
-`GoogleSSOService` (`google_sso.go`) adds Google as an alternative first
-factor beside a password, using standard OAuth 2.0 + OpenID Connect
-(authorization code flow, with PKCE):
+`GoogleSSOService` (`google_sso.go`) adds Google as an alternative to a
+password, using standard OAuth 2.0 + OpenID Connect (authorization code
+flow, with PKCE):
 
 ```go
 google, err := auth.NewGoogleSSOService(ctx, auth.GoogleSSOConfig{
@@ -261,18 +261,21 @@ start, err := authenticator.BeginGoogleLogin(ctx)
 
 // GET /auth/google/callback?state=...&code=...
 result, err := authenticator.CompleteGoogleLogin(ctx, r.URL.Query().Get("state"), r.URL.Query().Get("code"))
-// handled exactly like authenticator.Login's result: check MFARequired(),
-// or set result.SessionToken as the session cookie.
+// result.SessionToken is always set on success: set it as the session
+// cookie. MFARequired() is never true here (see below).
 ```
 
 A few decisions worth knowing about before wiring this in:
 
-- **It does not skip the account's own second factor.** Unlike a passkey —
-  which cryptographically proves possession of specific hardware and
-  (per `WebAuthnConfig`) typically user verification — a Google sign-in only
-  proves the browser currently holds a live Google session, which this
-  package treats as no stronger than a password. `CompleteGoogleLogin`
-  consults `RequiresSecondFactor` exactly like `Login` does.
+- **It completes the login on its own, without the account's second
+  factor.** `CompleteGoogleLogin` does not consult `RequiresSecondFactor`,
+  the same treatment `CompletePasswordlessLogin` gives a passkey: the
+  second step already happened at Google, and a six-digit code on top of
+  Google's own 2-Step Verification is a second prompt for the same proof.
+  The trade is that a Google login here is as strong as the Google account.
+  A deployment that wants every sign-in behind its own second factor should
+  enforce 2-Step Verification at Google (a Workspace policy, which
+  `HostedDomain` makes the relevant one) or not enable this.
 - **It never creates an account.** The first time a Google account signs in,
   `GoogleSSOService` links it to an existing user by a Google-verified email
   match (`email_verified` must be true) and persists that link via
