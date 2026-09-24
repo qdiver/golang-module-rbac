@@ -113,6 +113,10 @@ type GoogleSSOStore interface {
 	// account is matched by email.
 	LinkGoogleAccount(ctx context.Context, userID, subject string, at time.Time) error
 
+	// SetAvatarURL records the profile picture URL from a Google sign-in.
+	// Best-effort on the caller's side; an avatar is cosmetic.
+	SetAvatarURL(ctx context.Context, userID, url string, at time.Time) error
+
 	// InsertGoogleChallenge persists the nonce and PKCE verifier for one
 	// sign-in attempt, keyed by id.
 	InsertGoogleChallenge(ctx context.Context, id, nonce, codeVerifier string, now, expires time.Time) error
@@ -257,6 +261,7 @@ type googleClaims struct {
 	Email         string `json:"email"`
 	EmailVerified bool   `json:"email_verified"`
 	HostedDomain  string `json:"hd"`
+	Picture       string `json:"picture"`
 }
 
 // FinishLogin verifies the callback and resolves it to an account.
@@ -309,6 +314,7 @@ func (s *GoogleSSOService) FinishLogin(ctx context.Context, state, code string) 
 
 	switch u, err := s.store.UserByGoogleSubject(ctx, subject); {
 	case err == nil:
+		s.saveAvatar(ctx, u.ID, claims.Picture, now)
 		return u.ID, nil
 	case !errors.Is(err, ErrNotFound):
 		return "", fmt.Errorf("auth: look up linked Google account: %w", err)
@@ -332,7 +338,18 @@ func (s *GoogleSSOService) FinishLogin(ctx context.Context, state, code string) 
 	if err := s.store.LinkGoogleAccount(ctx, existing.ID, subject, now); err != nil {
 		return "", fmt.Errorf("auth: link Google account: %w", err)
 	}
+	s.saveAvatar(ctx, existing.ID, claims.Picture, now)
 	return existing.ID, nil
+}
+
+// saveAvatar records the profile picture from a Google sign-in. Best-effort:
+// an avatar is cosmetic, so a failure to store it must not fail the sign-in,
+// and an empty URL does nothing.
+func (s *GoogleSSOService) saveAvatar(ctx context.Context, userID, url string, at time.Time) {
+	if strings.TrimSpace(url) == "" {
+		return
+	}
+	_ = s.store.SetAvatarURL(ctx, userID, url, at)
 }
 
 // randomOpaqueString returns 256 bits of randomness, base64url-encoded —
