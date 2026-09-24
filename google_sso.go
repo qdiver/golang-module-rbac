@@ -87,8 +87,36 @@ var (
 	// A caller that wants self-service sign-up handles this error by
 	// provisioning the account itself (through Admin.CreateUser, with
 	// whatever role and org policy it chooses) and retrying.
+	//
+	// The error returned is a *GoogleAccountNotFoundError, which carries the
+	// Google-verified email and subject, so a caller can provision or tell
+	// the user which address went unrecognized. errors.Is(err,
+	// ErrGoogleAccountNotFound) matches it.
 	ErrGoogleAccountNotFound = errors.New("auth: no account is linked to that Google account")
 )
+
+// GoogleAccountNotFoundError is the error FinishLogin returns when a Google
+// sign-in verified but resolved to no account here.
+//
+// Email is the address Google vouched for (email_verified was true; an
+// unverified one is refused before this point as ErrGoogleEmailNotVerified)
+// and Subject is Google's stable identifier for the account. Both are safe
+// to show back to the person who just signed in: they are their own, and
+// Google has already proved they hold them, so nothing is disclosed that an
+// enumeration attacker could not learn by signing into Google as themselves.
+// Subject is what a caller passes to GoogleSSOStore.LinkGoogleAccount after
+// provisioning, so the next sign-in resolves without the email match.
+type GoogleAccountNotFoundError struct {
+	Email   string
+	Subject string
+}
+
+func (e *GoogleAccountNotFoundError) Error() string {
+	return fmt.Sprintf("%s (%s)", ErrGoogleAccountNotFound.Error(), e.Email)
+}
+
+// Unwrap makes errors.Is(err, ErrGoogleAccountNotFound) true.
+func (e *GoogleAccountNotFoundError) Unwrap() error { return ErrGoogleAccountNotFound }
 
 // FactorGoogle names Google as the credential that completed a login, the
 // same way FactorPasskey does for a passwordless one. Recorded via
@@ -327,10 +355,11 @@ func (s *GoogleSSOService) FinishLogin(ctx context.Context, state, code string) 
 		return "", ErrGoogleEmailNotVerified
 	}
 
-	existing, err := s.users.UserByEmail(ctx, strings.TrimSpace(claims.Email))
+	email := strings.TrimSpace(claims.Email)
+	existing, err := s.users.UserByEmail(ctx, email)
 	switch {
 	case errors.Is(err, ErrNotFound):
-		return "", ErrGoogleAccountNotFound
+		return "", &GoogleAccountNotFoundError{Email: email, Subject: subject}
 	case err != nil:
 		return "", fmt.Errorf("auth: look up account by email: %w", err)
 	}

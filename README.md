@@ -280,12 +280,15 @@ A few decisions worth knowing about before wiring this in:
   `GoogleSSOService` links it to an existing user by a Google-verified email
   match (`email_verified` must be true) and persists that link via
   `GoogleSSOStore.LinkGoogleAccount` for next time. If no account matches,
-  it returns `auth.ErrGoogleAccountNotFound` rather than provisioning one —
-  which organization a new user belongs to and what role they start with are
-  deployment policy, the same reasoning that keeps `AdminStore.CreateUser`
-  behind an authenticated, permitted actor. Handle that error by
-  provisioning through `Admin.CreateUser` yourself, if self-service sign-up
-  is what you want, and let the caller retry.
+  it returns a `*auth.GoogleAccountNotFoundError` (which `errors.Is`
+  matches against `auth.ErrGoogleAccountNotFound`) rather than provisioning
+  one — which organization a new user belongs to and what role they start
+  with are deployment policy, the same reasoning that keeps
+  `AdminStore.CreateUser` behind an authenticated, permitted actor. The
+  error carries the Google-verified `Email` and `Subject`, so you can tell
+  the person which address went unrecognized, or provision through
+  `Admin.CreateUser` yourself if self-service sign-up is what you want,
+  link it with `GoogleSSOStore.LinkGoogleAccount`, and let the caller retry.
 - **`HostedDomain`**, when set, refuses any Google account outside that
   Google Workspace domain (the ID token's `hd` claim) — useful for an
   internal tool that should only ever accept a company's own accounts.

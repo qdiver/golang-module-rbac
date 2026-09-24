@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -500,8 +501,24 @@ func TestGoogleFinishLoginRefusesAnUnknownAccount(t *testing.T) {
 	f := newGoogleTestFixture(t, "")
 	start := f.begin(t)
 
-	if _, err := f.svc.FinishLogin(context.Background(), start.State, "auth-code"); err != ErrGoogleAccountNotFound {
+	_, err := f.svc.FinishLogin(context.Background(), start.State, "auth-code")
+	if !errors.Is(err, ErrGoogleAccountNotFound) {
 		t.Fatalf("err = %v, want ErrGoogleAccountNotFound", err)
+	}
+	// The caller gets told WHO went unrecognized, so it can provision the
+	// account or tell the person which address it was.
+	var notFound *GoogleAccountNotFoundError
+	if !errors.As(err, &notFound) {
+		t.Fatalf("err = %T, want *GoogleAccountNotFoundError", err)
+	}
+	if notFound.Email != "person@example.com" {
+		t.Errorf("Email = %q, want the Google-verified address", notFound.Email)
+	}
+	if notFound.Subject != "google-subject-1" {
+		t.Errorf("Subject = %q, want Google's subject", notFound.Subject)
+	}
+	if len(f.store.links) != 0 {
+		t.Error("an account was linked for a user that does not exist")
 	}
 }
 
