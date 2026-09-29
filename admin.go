@@ -96,9 +96,24 @@ var (
 	// else's key, or disabling an account in another organization.
 	ErrNotPermitted = errors.New("auth: not permitted on this target")
 
-	// ErrLastAdmin is returned when disabling an account would leave an
-	// organization with no enabled administrator.
+	// ErrLastAdmin is returned when disabling, deleting or re-roling an
+	// account would leave an organization with no enabled holder of a
+	// protected role (PermissionTable.WithProtectedRoles; AdminRole by
+	// default).
 	ErrLastAdmin = errors.New("auth: that is the last enabled administrator")
+
+	// ErrPrivilegedTarget is returned when a caller who manages users acts
+	// on, or grants, a role PermissionTable.WithPrivilegedRoles holds back
+	// from them. It wraps ErrNotPermitted, so a caller that only ever
+	// checked that sentinel still refuses; one that wants to say why can
+	// check this first. Unlike the cross-organization case it discloses
+	// nothing: the caller can already see the target's role.
+	ErrPrivilegedTarget = fmt.Errorf("%w: that role is managed by a more senior administrator", ErrNotPermitted)
+
+	// ErrPasswordAlreadySet is returned by SetInitialPassword for an
+	// account that already has a password: an invitation sets the first
+	// one and never replaces it.
+	ErrPasswordAlreadySet = errors.New("auth: that account already has a password")
 )
 
 // MinPasswordLen is the floor on any password this package accepts.
@@ -227,15 +242,9 @@ func (a *Admin) recordChange(ctx context.Context, userID, previousHash string, p
 // hold once reports are scoped (ADR-0027 phase 3), when an account in the
 // wrong organization becomes a way to read another customer's findings.
 func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name string, role Role, password string) (User, error) {
-	if !actor.Can(a.table.ManageUsers) {
-		return User{}, ErrNotPermitted
-	}
-	if !a.table.Valid(role) {
-		return User{}, fmt.Errorf("auth: unknown role %q", role)
-	}
-	email = strings.TrimSpace(email)
-	if email == "" {
-		return User{}, errors.New("auth: an email address is required")
+	email, err := a.checkNewUser(actor, email, role)
+	if err != nil {
+		return User{}, err
 	}
 	// Against the policy of the organization the account is being created
 	// in, which is the caller's own — CreateUser takes the org from the
@@ -243,7 +252,85 @@ func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name stri
 	if err := a.policyFor(ctx, actor.OrgID).Check(password, email, name); err != nil {
 		return User{}, err
 	}
+	hash, err := HashPassword(password)
+	if err != nil {
+		return User{}, fmt.Errorf("auth: hash password: %w", err)
+	}
+	return a.insertUser(ctx, actor, email, name, role, hash)
+}
 
+// CreateInvitedUser adds an account with no password, for an invitation
+// rather than a password the administrator types and then has to pass on.
+//
+// The account cannot sign in with a password until SetInitialPassword gives
+// it one (Login refuses an empty hash exactly as it refuses a wrong
+// password); it can sign in by any other means the deployment offers, such
+// as Google, from the start. The authorization is CreateUser's.
+func (a *Admin) CreateInvitedUser(ctx context.Context, actor Identity, email, name string, role Role) (User, error) {
+	email, err := a.checkNewUser(actor, email, role)
+	if err != nil {
+		return User{}, err
+	}
+	return a.insertUser(ctx, actor, email, name, role, "")
+}
+
+// SetInitialPassword gives a password to an account that has never had one
+// — the redemption of an invitation made with CreateInvitedUser.
+//
+// It takes no actor: the person redeeming an invitation has no session yet.
+// Proving they hold a valid invitation is the caller's job, and this
+// refuses, with ErrPasswordAlreadySet, any account that already has a
+// password, so it can never be used to overwrite one — that is
+// ResetPassword, which does need an administrator. A disabled account is
+// refused as not found. The password is checked against the organization's
+// policy like any other.
+func (a *Admin) SetInitialPassword(ctx context.Context, userID, password string) error {
+	u, err := a.store.UserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if u.Disabled {
+		return ErrNotFound
+	}
+	if u.PasswordHash != "" {
+		return ErrPasswordAlreadySet
+	}
+	policy := a.policyFor(ctx, u.OrgID)
+	if err := policy.Check(password, u.Email, u.Name); err != nil {
+		return err
+	}
+	hash, err := HashPassword(password)
+	if err != nil {
+		return fmt.Errorf("auth: hash password: %w", err)
+	}
+	if err := a.store.SetPasswordHash(ctx, u.ID, hash); err != nil {
+		return fmt.Errorf("auth: set password: %w", err)
+	}
+	return a.recordChange(ctx, u.ID, "", policy)
+}
+
+// checkNewUser is the authorization and input check CreateUser and
+// CreateInvitedUser share, returning the trimmed email.
+func (a *Admin) checkNewUser(actor Identity, email string, role Role) (string, error) {
+	if !actor.Can(a.table.ManageUsers) {
+		return "", ErrNotPermitted
+	}
+	if !a.table.Valid(role) {
+		return "", fmt.Errorf("auth: unknown role %q", role)
+	}
+	if !a.table.MayHandle(actor.Role, role) {
+		return "", ErrPrivilegedTarget
+	}
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return "", errors.New("auth: an email address is required")
+	}
+	return email, nil
+}
+
+// insertUser writes the account CreateUser or CreateInvitedUser decided to
+// make, with hash empty for an invitation.
+func (a *Admin) insertUser(ctx context.Context, actor Identity, email, name string, role Role, hash string) (User, error) {
 	// Checked before the write so the caller gets a sentence rather than a
 	// constraint violation. The users_email_unique index is what actually
 	// guarantees it against a concurrent create; this check is for the
@@ -253,11 +340,6 @@ func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name stri
 		return User{}, ErrEmailTaken
 	case !errors.Is(err, ErrNotFound):
 		return User{}, fmt.Errorf("auth: check for an existing account: %w", err)
-	}
-
-	hash, err := HashPassword(password)
-	if err != nil {
-		return User{}, fmt.Errorf("auth: hash password: %w", err)
 	}
 
 	u := User{
@@ -298,8 +380,8 @@ func (a *Admin) DisableUser(ctx context.Context, actor Identity, userID string) 
 	if target.Disabled {
 		return nil // already disabled; nothing to do and nothing to report
 	}
-	if target.Role == a.table.AdminRole {
-		lastAdmin, err := a.isLastEnabledAdmin(ctx, target)
+	if a.table.Protected(target.Role) {
+		lastAdmin, err := a.isLastEnabledHolder(ctx, target)
 		if err != nil {
 			return err
 		}
@@ -355,14 +437,16 @@ func (a *Admin) EnableUser(ctx context.Context, actor Identity, userID string) e
 	return nil
 }
 
-// isLastEnabledAdmin reports whether target is the only enabled admin left.
-func (a *Admin) isLastEnabledAdmin(ctx context.Context, target User) (bool, error) {
+// isLastEnabledHolder reports whether target is the only enabled account
+// left in its organization holding target's role. Callers ask it only for a
+// protected role (PermissionTable.Protected).
+func (a *Admin) isLastEnabledHolder(ctx context.Context, target User) (bool, error) {
 	users, err := a.store.ListUsers(ctx, target.OrgID)
 	if err != nil {
 		return false, fmt.Errorf("auth: count administrators: %w", err)
 	}
 	for _, u := range users {
-		if u.ID != target.ID && u.Role == a.table.AdminRole && !u.Disabled {
+		if u.ID != target.ID && u.Role == target.Role && !u.Disabled {
 			return false, nil
 		}
 	}
@@ -389,8 +473,8 @@ func (a *Admin) DeleteUser(ctx context.Context, actor Identity, userID string) e
 	if err != nil {
 		return err
 	}
-	if target.Role == a.table.AdminRole && !target.Disabled {
-		last, err := a.isLastEnabledAdmin(ctx, target)
+	if a.table.Protected(target.Role) && !target.Disabled {
+		last, err := a.isLastEnabledHolder(ctx, target)
 		if err != nil {
 			return err
 		}
@@ -421,8 +505,14 @@ func (a *Admin) SetRole(ctx context.Context, actor Identity, userID string, role
 	if target.Role == role {
 		return nil // already there; nothing to do and nothing to report
 	}
-	if target.Role == a.table.AdminRole && role != a.table.AdminRole && !target.Disabled {
-		last, err := a.isLastEnabledAdmin(ctx, target)
+	// The grant is checked as well as the target: manageableTarget has
+	// already refused a privileged target, and this refuses promoting an
+	// ordinary one into a privileged role.
+	if !a.table.MayHandle(actor.Role, role) {
+		return ErrPrivilegedTarget
+	}
+	if a.table.Protected(target.Role) && !target.Disabled {
+		last, err := a.isLastEnabledHolder(ctx, target)
 		if err != nil {
 			return err
 		}
@@ -437,13 +527,14 @@ func (a *Admin) SetRole(ctx context.Context, actor Identity, userID string, role
 }
 
 // manageableTarget resolves an account the caller is allowed to act on,
-// applying the three checks every management operation shares: the caller
-// manages users at all, the target is in their organization, and it is not
-// themselves.
+// applying the checks every management operation shares: the caller
+// manages users at all, the target is not themselves, it is in their
+// organization, and its role is not one WithPrivilegedRoles holds back from
+// them.
 //
-// It exists so those three cannot drift apart across the operations — the
-// way they would if each one re-implemented them, and the way a fourth
-// operation added later would get them for free.
+// It exists so those checks cannot drift apart across the operations — the
+// way they would if each one re-implemented them, and the way another
+// operation added later gets them for free.
 func (a *Admin) manageableTarget(ctx context.Context, actor Identity, userID string) (User, error) {
 	if !actor.Can(a.table.ManageUsers) {
 		return User{}, ErrNotPermitted
@@ -459,6 +550,11 @@ func (a *Admin) manageableTarget(ctx context.Context, actor Identity, userID str
 		// Indistinguishable from "no such user": confirming that an id
 		// exists in another organization is itself a disclosure.
 		return User{}, ErrNotFound
+	}
+	// After the organization check, so a privileged account elsewhere
+	// still reads as not found.
+	if !a.table.MayHandle(actor.Role, target.Role) {
+		return User{}, ErrPrivilegedTarget
 	}
 	return target, nil
 }

@@ -10,7 +10,10 @@
 // not the specific roles or permissions — behind "which role may do what".
 package auth
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // Role is the authority a credential carries.
 //
@@ -47,6 +50,11 @@ type Permission string
 // last-enabled-administrator check protects — the one every organization
 // must keep at least one enabled instance of, and the one SystemIdentity
 // acts as.
+//
+// Two optional refinements cover a deployment with more than one tier of
+// administrator: WithProtectedRoles widens (or moves) the last-enabled
+// check beyond AdminRole, and WithPrivilegedRoles holds some roles back
+// from anyone who manages users but lacks a further permission.
 type PermissionTable struct {
 	perms map[Role]map[Permission]bool
 
@@ -55,9 +63,19 @@ type PermissionTable struct {
 	ManageUsers Permission
 
 	// AdminRole is the role treated as "an administrator" for the
-	// last-enabled-administrator safety check, and the role SystemIdentity
-	// carries.
+	// last-enabled-administrator safety check (unless WithProtectedRoles
+	// names others), and the role SystemIdentity carries.
 	AdminRole Role
+
+	// protected are the roles each organization must keep at least one
+	// enabled holder of. Nil means just AdminRole, the behavior before
+	// WithProtectedRoles existed.
+	protected []Role
+
+	// privileged are the roles only a holder of managePrivileged may act on
+	// or grant. Empty means no role is held back beyond ManageUsers.
+	privileged       map[Role]bool
+	managePrivileged Permission
 }
 
 // NewPermissionTable builds a PermissionTable from a project's own role and
@@ -125,6 +143,156 @@ func (t *PermissionTable) Can(role Role, p Permission) bool {
 		return false
 	}
 	return t.perms[role][p]
+}
+
+// WithProtectedRoles returns a copy of the table whose last-enabled check
+// guards each of roles instead of AdminRole alone: disabling, deleting or
+// re-roling an account is refused with ErrLastAdmin when it is the only
+// enabled holder of a protected role in its organization.
+//
+// Each role is counted on its own, not as a group. A deployment with an
+// admin and a super admin tier, where only the super admin may create
+// another super admin, needs the last super admin kept even while plain
+// admins remain — a group count would let the last one go and leave
+// nobody able to mint a replacement. Conversely, a role left out of the
+// list is not guarded at all, so a deployment that protects only its top
+// tier may retire its last plain admin freely.
+//
+// The receiver is not modified: a table is shared by every service in a
+// process, and an option that mutated it would change the rules under
+// whichever service had already been built.
+func (t *PermissionTable) WithProtectedRoles(roles ...Role) (*PermissionTable, error) {
+	if len(roles) == 0 {
+		return nil, fmt.Errorf("auth: WithProtectedRoles needs at least one role")
+	}
+	for _, r := range roles {
+		if !t.Valid(r) {
+			return nil, fmt.Errorf("auth: protected role %q is not one of the table's roles", r)
+		}
+	}
+	c := *t
+	c.protected = append([]Role(nil), roles...)
+	return &c, nil
+}
+
+// WithPrivilegedRoles returns a copy of the table in which acting on an
+// account that holds one of roles — disabling, enabling, deleting,
+// re-roling, resetting its password or its second factor — and granting one
+// of roles, whether by CreateUser or SetRole, needs manage in addition to
+// ManageUsers. A caller without it gets ErrPrivilegedTarget.
+//
+// It exists because ManageUsers alone is one flat tier: anyone holding it
+// could demote, disable or strip the factor from the most senior account
+// in the organization, or promote a colleague to it. The narrower
+// permission is what lets a deployment say "admins run the everyday roster;
+// only a super admin touches admins".
+//
+// manage must be carried by at least one role, and every role carrying it
+// must itself be privileged and carry ManageUsers — a role that could
+// manage privileged accounts without being one would be a quieter way to
+// the same authority, and one without ManageUsers could never use it.
+func (t *PermissionTable) WithPrivilegedRoles(manage Permission, roles ...Role) (*PermissionTable, error) {
+	if manage == "" {
+		return nil, fmt.Errorf("auth: WithPrivilegedRoles needs a permission")
+	}
+	if len(roles) == 0 {
+		return nil, fmt.Errorf("auth: WithPrivilegedRoles needs at least one role")
+	}
+	set := make(map[Role]bool, len(roles))
+	for _, r := range roles {
+		if !t.Valid(r) {
+			return nil, fmt.Errorf("auth: privileged role %q is not one of the table's roles", r)
+		}
+		set[r] = true
+	}
+	holders := 0
+	for role, perms := range t.perms {
+		if !perms[manage] {
+			continue
+		}
+		holders++
+		if !set[role] {
+			return nil, fmt.Errorf("auth: role %q carries %q but is not itself privileged", role, manage)
+		}
+		if !perms[t.ManageUsers] {
+			return nil, fmt.Errorf("auth: role %q carries %q but not %q", role, manage, t.ManageUsers)
+		}
+	}
+	if holders == 0 {
+		return nil, fmt.Errorf("auth: no role carries %q, so no one could manage a privileged account", manage)
+	}
+	c := *t
+	c.privileged = set
+	c.managePrivileged = manage
+	return &c, nil
+}
+
+// Protected reports whether an organization must keep at least one enabled
+// holder of role (WithProtectedRoles; AdminRole by default).
+func (t *PermissionTable) Protected(role Role) bool {
+	if t == nil {
+		return false
+	}
+	if t.protected == nil {
+		return role == t.AdminRole
+	}
+	for _, r := range t.protected {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// Privileged reports whether role is one only a holder of the
+// WithPrivilegedRoles permission may act on or grant.
+func (t *PermissionTable) Privileged(role Role) bool {
+	return t != nil && t.privileged[role]
+}
+
+// MayHandle reports whether a caller holding callerRole may act on an
+// account holding role, or grant role — the WithPrivilegedRoles rule alone,
+// on top of (not instead of) ManageUsers. Every role is handleable when no
+// privileged roles are configured. A UI uses it to offer only the roles and
+// row actions the server will accept.
+func (t *PermissionTable) MayHandle(callerRole, role Role) bool {
+	if !t.Privileged(role) {
+		return true
+	}
+	return t.Can(callerRole, t.managePrivileged)
+}
+
+// Roles returns every role the table defines, sorted, so a deployment can
+// render its own permission matrix from the table that is actually
+// enforced rather than from a copy that can drift.
+func (t *PermissionTable) Roles() []Role {
+	if t == nil {
+		return nil
+	}
+	out := make([]Role, 0, len(t.perms))
+	for r := range t.perms {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// Permissions returns every permission role carries, sorted; nil for an
+// unknown role.
+func (t *PermissionTable) Permissions(role Role) []Permission {
+	if t == nil {
+		return nil
+	}
+	set := t.perms[role]
+	if set == nil {
+		return nil
+	}
+	out := make([]Permission, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // Valid reports whether role is one this table defines.
