@@ -113,7 +113,12 @@ table, err = table.WithProtectedRoles(RoleSuperAdmin)
   role on its own instead of the admin role, so the last super admin is kept
   even while plain admins remain, and the last plain admin may go.
 
-Both return a copy; with neither set the table behaves as before.
+- `WithRoleGuards(map[Role]Permission)`: the same rule with a permission per
+  role, for more than two tiers — e.g. an IT admin who manages admins
+  (`users:manage_admins`) but not super admins (`users:manage_super`).
+  `WithPrivilegedRoles` is this with one permission for every role.
+
+Each returns a copy; with none set the table behaves as before.
 
 Every authorization decision goes through `Can`, most often via the
 `Identity` it was resolved against:

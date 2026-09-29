@@ -295,3 +295,96 @@ func TestAnUnprotectedRolesLastHolderMayGo(t *testing.T) {
 	require.NoError(t, a.SetRole(ctx, actor, "u-admin", testViewer))
 	require.NoError(t, a.DisableUser(ctx, actor, "u-admin"))
 }
+
+// --- per-role guards (three tiers) -------------------------------------------
+
+// Three tiers: an IT administrator manages admins and other IT
+// administrators, but not the owner tier; only an owner manages owners.
+const (
+	tierIT          auth.Role       = "it_admin"
+	permManageAdmin auth.Permission = "users:manage_admins"
+	permManageOwner auth.Permission = "users:manage_super"
+)
+
+func threeTierTable(t *testing.T) *auth.PermissionTable {
+	t.Helper()
+	base, err := auth.NewPermissionTable(map[auth.Role][]auth.Permission{
+		testViewer: {testPermRead},
+		testAdmin:  {testPermRead, testPermUsers},
+		tierIT:     {testPermUsers, permManageAdmin},
+		tierOwner:  {testPermRead, testPermUsers, permManageAdmin, permManageOwner},
+	}, testPermUsers, tierOwner)
+	require.NoError(t, err)
+	table, err := base.WithRoleGuards(map[auth.Role]auth.Permission{
+		testAdmin: permManageAdmin, tierIT: permManageAdmin, tierOwner: permManageOwner,
+	})
+	require.NoError(t, err)
+	table, err = table.WithProtectedRoles(tierOwner, tierIT)
+	require.NoError(t, err)
+	return table
+}
+
+func TestRoleGuardsGiveEachTierItsOwnPermission(t *testing.T) {
+	t.Parallel()
+	table := threeTierTable(t)
+	cases := []struct {
+		caller, target auth.Role
+		want           bool
+	}{
+		{tierIT, testViewer, true},
+		{tierIT, testAdmin, true},
+		{tierIT, tierIT, true},
+		{tierIT, tierOwner, false}, // the reason for per-role guards
+		{testAdmin, testViewer, true},
+		{testAdmin, testAdmin, false},
+		{testAdmin, tierIT, false},
+		{tierOwner, tierOwner, true},
+		{tierOwner, tierIT, true},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, table.MayHandle(c.caller, c.target), "%s → %s", c.caller, c.target)
+	}
+}
+
+func TestAnITAdminCannotMakeOrTouchAnOwner(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	table := threeTierTable(t)
+	store := newFakeAdminStore()
+	a, err := auth.NewAdmin(store, stubClock{mfaNow}, &stubIDs{}, table)
+	require.NoError(t, err)
+	seedRole(store, "u-it", tierIT)
+	seedRole(store, "u-it-2", tierIT)
+	seedRole(store, "u-owner", tierOwner)
+	seedRole(store, "u-owner-2", tierOwner)
+	seedRole(store, "u-viewer", testViewer)
+	it := actorAs(table, "u-it", tierIT)
+
+	assert.ErrorIs(t, a.SetRole(ctx, it, "u-viewer", tierOwner), auth.ErrPrivilegedTarget)
+	assert.ErrorIs(t, a.DisableUser(ctx, it, "u-owner"), auth.ErrPrivilegedTarget)
+	_, err = a.CreateInvitedUser(ctx, it, "boss@example.com", "", tierOwner)
+	assert.ErrorIs(t, err, auth.ErrPrivilegedTarget)
+
+	// Everything below the owner tier is theirs.
+	require.NoError(t, a.SetRole(ctx, it, "u-viewer", testAdmin))
+	require.NoError(t, a.DisableUser(ctx, it, "u-it-2"))
+	_, err = a.CreateInvitedUser(ctx, it, "it2@example.com", "", tierIT)
+	require.NoError(t, err)
+}
+
+func TestRoleGuardsRejectAnUnguardedHolderAndAnUnheldPermission(t *testing.T) {
+	t.Parallel()
+	base, err := auth.NewPermissionTable(map[auth.Role][]auth.Permission{
+		testViewer: {testPermUsers, permManageAdmin}, // holds the guard, but is not guarded
+		tierOwner:  {testPermUsers, permManageAdmin, permManageOwner},
+	}, testPermUsers, tierOwner)
+	require.NoError(t, err)
+	_, err = base.WithRoleGuards(map[auth.Role]auth.Permission{tierOwner: permManageOwner, testViewer: ""})
+	assert.Error(t, err, "an empty permission")
+	_, err = base.WithRoleGuards(map[auth.Role]auth.Permission{tierOwner: permManageAdmin})
+	assert.Error(t, err, "viewer holds manage_admins without being guarded")
+	_, err = tieredBase(t).WithRoleGuards(map[auth.Role]auth.Permission{tierOwner: "users:nobody"})
+	assert.Error(t, err, "a permission no role holds")
+	_, err = tieredBase(t).WithRoleGuards(nil)
+	assert.Error(t, err)
+}
