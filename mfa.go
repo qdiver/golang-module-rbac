@@ -365,6 +365,11 @@ func (m *MFAService) ClearFactorFor(ctx context.Context, actor Identity, userID 
 	if target.OrgID != actor.OrgID {
 		return ErrNotPermitted
 	}
+	// The same seniority rule Admin's operations apply: stripping a senior
+	// account's factor is as much an act on it as disabling it.
+	if !m.table.MayHandle(actor.Role, target.Role) {
+		return ErrPrivilegedTarget
+	}
 	if err := m.store.DeleteTOTP(ctx, userID); err != nil {
 		return fmt.Errorf("auth: remove the second factor: %w", err)
 	}

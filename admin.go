@@ -96,9 +96,19 @@ var (
 	// else's key, or disabling an account in another organization.
 	ErrNotPermitted = errors.New("auth: not permitted on this target")
 
-	// ErrLastAdmin is returned when disabling an account would leave an
-	// organization with no enabled administrator.
+	// ErrLastAdmin is returned when disabling, deleting or re-roling an
+	// account would leave an organization with no enabled holder of a
+	// protected role (PermissionTable.WithProtectedRoles; AdminRole by
+	// default).
 	ErrLastAdmin = errors.New("auth: that is the last enabled administrator")
+
+	// ErrPrivilegedTarget is returned when a caller who manages users acts
+	// on, or grants, a role PermissionTable.WithPrivilegedRoles holds back
+	// from them. It wraps ErrNotPermitted, so a caller that only ever
+	// checked that sentinel still refuses; one that wants to say why can
+	// check this first. Unlike the cross-organization case it discloses
+	// nothing: the caller can already see the target's role.
+	ErrPrivilegedTarget = fmt.Errorf("%w: that role is managed by a more senior administrator", ErrNotPermitted)
 )
 
 // MinPasswordLen is the floor on any password this package accepts.
@@ -233,6 +243,9 @@ func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name stri
 	if !a.table.Valid(role) {
 		return User{}, fmt.Errorf("auth: unknown role %q", role)
 	}
+	if !a.table.MayHandle(actor.Role, role) {
+		return User{}, ErrPrivilegedTarget
+	}
 	email = strings.TrimSpace(email)
 	if email == "" {
 		return User{}, errors.New("auth: an email address is required")
@@ -298,8 +311,8 @@ func (a *Admin) DisableUser(ctx context.Context, actor Identity, userID string) 
 	if target.Disabled {
 		return nil // already disabled; nothing to do and nothing to report
 	}
-	if target.Role == a.table.AdminRole {
-		lastAdmin, err := a.isLastEnabledAdmin(ctx, target)
+	if a.table.Protected(target.Role) {
+		lastAdmin, err := a.isLastEnabledHolder(ctx, target)
 		if err != nil {
 			return err
 		}
@@ -355,14 +368,16 @@ func (a *Admin) EnableUser(ctx context.Context, actor Identity, userID string) e
 	return nil
 }
 
-// isLastEnabledAdmin reports whether target is the only enabled admin left.
-func (a *Admin) isLastEnabledAdmin(ctx context.Context, target User) (bool, error) {
+// isLastEnabledHolder reports whether target is the only enabled account
+// left in its organization holding target's role. Callers ask it only for a
+// protected role (PermissionTable.Protected).
+func (a *Admin) isLastEnabledHolder(ctx context.Context, target User) (bool, error) {
 	users, err := a.store.ListUsers(ctx, target.OrgID)
 	if err != nil {
 		return false, fmt.Errorf("auth: count administrators: %w", err)
 	}
 	for _, u := range users {
-		if u.ID != target.ID && u.Role == a.table.AdminRole && !u.Disabled {
+		if u.ID != target.ID && u.Role == target.Role && !u.Disabled {
 			return false, nil
 		}
 	}
@@ -389,8 +404,8 @@ func (a *Admin) DeleteUser(ctx context.Context, actor Identity, userID string) e
 	if err != nil {
 		return err
 	}
-	if target.Role == a.table.AdminRole && !target.Disabled {
-		last, err := a.isLastEnabledAdmin(ctx, target)
+	if a.table.Protected(target.Role) && !target.Disabled {
+		last, err := a.isLastEnabledHolder(ctx, target)
 		if err != nil {
 			return err
 		}
@@ -421,8 +436,14 @@ func (a *Admin) SetRole(ctx context.Context, actor Identity, userID string, role
 	if target.Role == role {
 		return nil // already there; nothing to do and nothing to report
 	}
-	if target.Role == a.table.AdminRole && role != a.table.AdminRole && !target.Disabled {
-		last, err := a.isLastEnabledAdmin(ctx, target)
+	// The grant is checked as well as the target: manageableTarget has
+	// already refused a privileged target, and this refuses promoting an
+	// ordinary one into a privileged role.
+	if !a.table.MayHandle(actor.Role, role) {
+		return ErrPrivilegedTarget
+	}
+	if a.table.Protected(target.Role) && !target.Disabled {
+		last, err := a.isLastEnabledHolder(ctx, target)
 		if err != nil {
 			return err
 		}
@@ -437,13 +458,14 @@ func (a *Admin) SetRole(ctx context.Context, actor Identity, userID string, role
 }
 
 // manageableTarget resolves an account the caller is allowed to act on,
-// applying the three checks every management operation shares: the caller
-// manages users at all, the target is in their organization, and it is not
-// themselves.
+// applying the checks every management operation shares: the caller
+// manages users at all, the target is not themselves, it is in their
+// organization, and its role is not one WithPrivilegedRoles holds back from
+// them.
 //
-// It exists so those three cannot drift apart across the operations — the
-// way they would if each one re-implemented them, and the way a fourth
-// operation added later would get them for free.
+// It exists so those checks cannot drift apart across the operations — the
+// way they would if each one re-implemented them, and the way another
+// operation added later gets them for free.
 func (a *Admin) manageableTarget(ctx context.Context, actor Identity, userID string) (User, error) {
 	if !actor.Can(a.table.ManageUsers) {
 		return User{}, ErrNotPermitted
@@ -459,6 +481,11 @@ func (a *Admin) manageableTarget(ctx context.Context, actor Identity, userID str
 		// Indistinguishable from "no such user": confirming that an id
 		// exists in another organization is itself a disclosure.
 		return User{}, ErrNotFound
+	}
+	// After the organization check, so a privileged account elsewhere
+	// still reads as not found.
+	if !a.table.MayHandle(actor.Role, target.Role) {
+		return User{}, ErrPrivilegedTarget
 	}
 	return target, nil
 }

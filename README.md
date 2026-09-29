@@ -93,6 +93,28 @@ organization must keep at least one enabled instance of — and who
 actually carry the `ManageUsers` permission in your table, since that
 combination can never do anything useful.
 
+### Two tiers of administrator
+
+`ManageUsers` alone is one flat tier: anyone holding it can demote, disable
+or strip the factor from the most senior account, or promote a colleague to
+it. Two optional table options split it:
+
+```go
+table, err = table.WithPrivilegedRoles(PermManageAdmins, RoleAdmin, RoleSuperAdmin)
+table, err = table.WithProtectedRoles(RoleSuperAdmin)
+```
+
+- `WithPrivilegedRoles(perm, roles...)`: acting on an account holding one of
+  `roles`, or granting one, needs `perm` as well as `ManageUsers`; otherwise
+  `ErrPrivilegedTarget` (which wraps `ErrNotPermitted`). Applies to every
+  `Admin` operation on another account and to `MFAService.ClearFactorFor`.
+  `PermissionTable.MayHandle` answers the same question for a UI.
+- `WithProtectedRoles(roles...)`: the last-enabled check guards each listed
+  role on its own instead of the admin role, so the last super admin is kept
+  even while plain admins remain, and the last plain admin may go.
+
+Both return a copy; with neither set the table behaves as before.
+
 Every authorization decision goes through `Can`, most often via the
 `Identity` it was resolved against:
 
