@@ -109,6 +109,11 @@ var (
 	// check this first. Unlike the cross-organization case it discloses
 	// nothing: the caller can already see the target's role.
 	ErrPrivilegedTarget = fmt.Errorf("%w: that role is managed by a more senior administrator", ErrNotPermitted)
+
+	// ErrPasswordAlreadySet is returned by SetInitialPassword for an
+	// account that already has a password: an invitation sets the first
+	// one and never replaces it.
+	ErrPasswordAlreadySet = errors.New("auth: that account already has a password")
 )
 
 // MinPasswordLen is the floor on any password this package accepts.
@@ -237,18 +242,9 @@ func (a *Admin) recordChange(ctx context.Context, userID, previousHash string, p
 // hold once reports are scoped (ADR-0027 phase 3), when an account in the
 // wrong organization becomes a way to read another customer's findings.
 func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name string, role Role, password string) (User, error) {
-	if !actor.Can(a.table.ManageUsers) {
-		return User{}, ErrNotPermitted
-	}
-	if !a.table.Valid(role) {
-		return User{}, fmt.Errorf("auth: unknown role %q", role)
-	}
-	if !a.table.MayHandle(actor.Role, role) {
-		return User{}, ErrPrivilegedTarget
-	}
-	email = strings.TrimSpace(email)
-	if email == "" {
-		return User{}, errors.New("auth: an email address is required")
+	email, err := a.checkNewUser(actor, email, role)
+	if err != nil {
+		return User{}, err
 	}
 	// Against the policy of the organization the account is being created
 	// in, which is the caller's own — CreateUser takes the org from the
@@ -256,7 +252,85 @@ func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name stri
 	if err := a.policyFor(ctx, actor.OrgID).Check(password, email, name); err != nil {
 		return User{}, err
 	}
+	hash, err := HashPassword(password)
+	if err != nil {
+		return User{}, fmt.Errorf("auth: hash password: %w", err)
+	}
+	return a.insertUser(ctx, actor, email, name, role, hash)
+}
 
+// CreateInvitedUser adds an account with no password, for an invitation
+// rather than a password the administrator types and then has to pass on.
+//
+// The account cannot sign in with a password until SetInitialPassword gives
+// it one (Login refuses an empty hash exactly as it refuses a wrong
+// password); it can sign in by any other means the deployment offers, such
+// as Google, from the start. The authorization is CreateUser's.
+func (a *Admin) CreateInvitedUser(ctx context.Context, actor Identity, email, name string, role Role) (User, error) {
+	email, err := a.checkNewUser(actor, email, role)
+	if err != nil {
+		return User{}, err
+	}
+	return a.insertUser(ctx, actor, email, name, role, "")
+}
+
+// SetInitialPassword gives a password to an account that has never had one
+// — the redemption of an invitation made with CreateInvitedUser.
+//
+// It takes no actor: the person redeeming an invitation has no session yet.
+// Proving they hold a valid invitation is the caller's job, and this
+// refuses, with ErrPasswordAlreadySet, any account that already has a
+// password, so it can never be used to overwrite one — that is
+// ResetPassword, which does need an administrator. A disabled account is
+// refused as not found. The password is checked against the organization's
+// policy like any other.
+func (a *Admin) SetInitialPassword(ctx context.Context, userID, password string) error {
+	u, err := a.store.UserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if u.Disabled {
+		return ErrNotFound
+	}
+	if u.PasswordHash != "" {
+		return ErrPasswordAlreadySet
+	}
+	policy := a.policyFor(ctx, u.OrgID)
+	if err := policy.Check(password, u.Email, u.Name); err != nil {
+		return err
+	}
+	hash, err := HashPassword(password)
+	if err != nil {
+		return fmt.Errorf("auth: hash password: %w", err)
+	}
+	if err := a.store.SetPasswordHash(ctx, u.ID, hash); err != nil {
+		return fmt.Errorf("auth: set password: %w", err)
+	}
+	return a.recordChange(ctx, u.ID, "", policy)
+}
+
+// checkNewUser is the authorization and input check CreateUser and
+// CreateInvitedUser share, returning the trimmed email.
+func (a *Admin) checkNewUser(actor Identity, email string, role Role) (string, error) {
+	if !actor.Can(a.table.ManageUsers) {
+		return "", ErrNotPermitted
+	}
+	if !a.table.Valid(role) {
+		return "", fmt.Errorf("auth: unknown role %q", role)
+	}
+	if !a.table.MayHandle(actor.Role, role) {
+		return "", ErrPrivilegedTarget
+	}
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return "", errors.New("auth: an email address is required")
+	}
+	return email, nil
+}
+
+// insertUser writes the account CreateUser or CreateInvitedUser decided to
+// make, with hash empty for an invitation.
+func (a *Admin) insertUser(ctx context.Context, actor Identity, email, name string, role Role, hash string) (User, error) {
 	// Checked before the write so the caller gets a sentence rather than a
 	// constraint violation. The users_email_unique index is what actually
 	// guarantees it against a concurrent create; this check is for the
@@ -266,11 +340,6 @@ func (a *Admin) CreateUser(ctx context.Context, actor Identity, email, name stri
 		return User{}, ErrEmailTaken
 	case !errors.Is(err, ErrNotFound):
 		return User{}, fmt.Errorf("auth: check for an existing account: %w", err)
-	}
-
-	hash, err := HashPassword(password)
-	if err != nil {
-		return User{}, fmt.Errorf("auth: hash password: %w", err)
 	}
 
 	u := User{

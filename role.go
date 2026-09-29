@@ -10,7 +10,10 @@
 // not the specific roles or permissions — behind "which role may do what".
 package auth
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // Role is the authority a credential carries.
 //
@@ -257,6 +260,39 @@ func (t *PermissionTable) MayHandle(callerRole, role Role) bool {
 		return true
 	}
 	return t.Can(callerRole, t.managePrivileged)
+}
+
+// Roles returns every role the table defines, sorted, so a deployment can
+// render its own permission matrix from the table that is actually
+// enforced rather than from a copy that can drift.
+func (t *PermissionTable) Roles() []Role {
+	if t == nil {
+		return nil
+	}
+	out := make([]Role, 0, len(t.perms))
+	for r := range t.perms {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// Permissions returns every permission role carries, sorted; nil for an
+// unknown role.
+func (t *PermissionTable) Permissions(role Role) []Permission {
+	if t == nil {
+		return nil
+	}
+	set := t.perms[role]
+	if set == nil {
+		return nil
+	}
+	out := make([]Permission, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // Valid reports whether role is one this table defines.
