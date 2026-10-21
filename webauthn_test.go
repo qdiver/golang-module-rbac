@@ -987,6 +987,33 @@ func TestAStepUpCeremonyIsSingleUse(t *testing.T) {
 		auth.ErrWebAuthnCeremonyExpired, "a step-up ceremony was replayed")
 }
 
+// TestAStepUpNeedsUserVerification. A step-up is stamped on a session that
+// already exists, so the key is not a second factor beside a password here:
+// it is the proof that the account holder is the one at the keyboard. A key
+// that only proves possession is refused; the same key with its PIN passes.
+func TestAStepUpNeedsUserVerification(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _ := newWebAuthnFixture(t)
+	device := webauthntest.New(t)
+	registerKey(t, svc, device, "Old YubiKey")
+
+	c, err := svc.BeginStepUp(context.Background(), "u-1")
+	require.NoError(t, err)
+	assert.Contains(t, string(c.Options), `"userVerification":"required"`)
+
+	device.NoUserVerification = true
+	err = svc.FinishStepUp(context.Background(), "u-1", c.ChallengeID,
+		device.Assert(t, webauthntest.ChallengeFrom(t, c.Options), waOrigin, waRPID))
+	assert.ErrorIs(t, err, auth.ErrWebAuthnRejected, "a key with no user verification passed a step-up")
+
+	device.NoUserVerification = false
+	c, err = svc.BeginStepUp(context.Background(), "u-1")
+	require.NoError(t, err)
+	require.NoError(t, svc.FinishStepUp(context.Background(), "u-1", c.ChallengeID,
+		device.Assert(t, webauthntest.ChallengeFrom(t, c.Options), waOrigin, waRPID)))
+}
+
 // TestAStepUpNeedsAKeyToBeginWith.
 func TestAStepUpNeedsAKeyToBeginWith(t *testing.T) {
 	t.Parallel()
