@@ -507,7 +507,8 @@ func (s *WebAuthnService) HasCredentials(ctx context.Context, userID string) boo
 // to, so nothing here identifies anybody — which is the point. A front door
 // that took an email first would confirm which addresses have accounts.
 //
-// User verification is REQUIRED, unlike every other ceremony in this file.
+// User verification is REQUIRED, as it is for a step-up (BeginStepUp) and
+// unlike every other ceremony in this file.
 // Elsewhere a key is the SECOND factor and the password was the first, so a
 // U2F-era key with no PIN or biometric is still a real second factor. Here
 // there is no password, and a key that only proves possession would make
@@ -588,6 +589,14 @@ func (s *WebAuthnService) FinishPasswordlessLogin(ctx context.Context, challenge
 // to, while this one is bound to the account that asked for it. That binding
 // is what stops a challenge issued to one signed-in user being answered on
 // behalf of another.
+//
+// User verification is REQUIRED here too, as it is for a passwordless
+// sign-in. A step-up says "the person at this keyboard is the account
+// holder", and the session it is stamped on already exists, so the session
+// is not a first factor this proof sits beside: a key that only proves
+// possession would let whoever holds the session and finds the key through
+// every gate behind a step-up. The PIN or biometric is what makes it a
+// proof of the person.
 func (s *WebAuthnService) BeginStepUp(ctx context.Context, userID string) (Ceremony, error) {
 	u, existing, err := s.userFor(ctx, userID)
 	if err != nil {
@@ -597,7 +606,7 @@ func (s *WebAuthnService) BeginStepUp(ctx context.Context, userID string) (Cerem
 		return Ceremony{}, ErrWebAuthnNotRegistered
 	}
 
-	assertion, session, err := s.wa.BeginLogin(u)
+	assertion, session, err := s.wa.BeginLogin(u, webauthn.WithUserVerification(protocol.VerificationRequired))
 	if err != nil {
 		return Ceremony{}, fmt.Errorf("auth: begin step-up: %w", err)
 	}
