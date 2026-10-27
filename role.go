@@ -13,6 +13,7 @@ package auth
 import (
 	"fmt"
 	"sort"
+	"sync/atomic"
 )
 
 // Role is the authority a credential carries.
@@ -56,16 +57,27 @@ type Permission string
 // check beyond AdminRole, and WithPrivilegedRoles holds some roles back
 // from anyone who manages users but lacks a further permission.
 type PermissionTable struct {
-	perms map[Role]map[Permission]bool
+	// st is the table's rules, swapped whole by Replace. Every reader loads
+	// it once per call, so a reader sees either the old rules or the new
+	// ones, never a mixture inside one call.
+	st atomic.Pointer[tableState]
 
 	// ManageUsers is the permission this package's own account-management
-	// use cases require of a caller.
+	// use cases require of a caller. It never changes for the life of a
+	// table: Replace refuses a table that names a different one.
 	ManageUsers Permission
 
 	// AdminRole is the role treated as "an administrator" for the
 	// last-enabled-administrator safety check (unless WithProtectedRoles
-	// names others), and the role SystemIdentity carries.
+	// names others), and the role SystemIdentity carries. Fixed like
+	// ManageUsers.
 	AdminRole Role
+}
+
+// tableState is the replaceable part of a PermissionTable. It is immutable
+// once stored.
+type tableState struct {
+	perms map[Role]map[Permission]bool
 
 	// protected are the roles each organization must keep at least one
 	// enabled holder of. Nil means just AdminRole, the behavior before
@@ -76,6 +88,50 @@ type PermissionTable struct {
 	// ManageUsers, to act on an account holding it or to grant it. Nil
 	// means no role is held back (WithRoleGuards, WithPrivilegedRoles).
 	guards map[Role]Permission
+}
+
+// state returns the current rules; a nil table has none.
+func (t *PermissionTable) state() *tableState {
+	if t == nil {
+		return &tableState{}
+	}
+	if s := t.st.Load(); s != nil {
+		return s
+	}
+	return &tableState{}
+}
+
+// clone returns an independent table carrying the receiver's current rules,
+// for the With* options (a table cannot be copied by value: it holds an
+// atomic).
+func (t *PermissionTable) clone() *PermissionTable {
+	c := &PermissionTable{ManageUsers: t.ManageUsers, AdminRole: t.AdminRole}
+	s := *t.state()
+	c.st.Store(&s)
+	return c
+}
+
+// Replace swaps next's rules into the receiver, in place, so every service
+// and Identity already holding the receiver sees the change on its next
+// check. It exists for deployments whose roles are edited at run time: build
+// the new table with NewPermissionTable and its With* options as at startup
+// (so every construction check runs), then Replace it in.
+//
+// next must name the same ManageUsers permission and AdminRole as the
+// receiver, since both are baked into the services built from it. Replace
+// is safe to call concurrently with any reader. It does not touch sessions:
+// they store a role, not its permissions, so an edited role bites on the
+// holder's next request.
+func (t *PermissionTable) Replace(next *PermissionTable) error {
+	if t == nil || next == nil {
+		return fmt.Errorf("auth: Replace needs two tables")
+	}
+	if next.ManageUsers != t.ManageUsers || next.AdminRole != t.AdminRole {
+		return fmt.Errorf("auth: Replace cannot change ManageUsers or AdminRole")
+	}
+	s := *next.state()
+	t.st.Store(&s)
+	return nil
 }
 
 // NewPermissionTable builds a PermissionTable from a project's own role and
@@ -127,7 +183,9 @@ func NewPermissionTable(table map[Role][]Permission, manageUsers Permission, adm
 		return nil, fmt.Errorf("auth: admin role %q does not carry the manageUsers permission %q", adminRole, manageUsers)
 	}
 
-	return &PermissionTable{perms: perms, ManageUsers: manageUsers, AdminRole: adminRole}, nil
+	t := &PermissionTable{ManageUsers: manageUsers, AdminRole: adminRole}
+	t.st.Store(&tableState{perms: perms})
+	return t, nil
 }
 
 // Can reports whether the role carries the permission.
@@ -142,7 +200,7 @@ func (t *PermissionTable) Can(role Role, p Permission) bool {
 	if t == nil {
 		return false
 	}
-	return t.perms[role][p]
+	return t.state().perms[role][p]
 }
 
 // WithProtectedRoles returns a copy of the table whose last-enabled check
@@ -170,9 +228,11 @@ func (t *PermissionTable) WithProtectedRoles(roles ...Role) (*PermissionTable, e
 			return nil, fmt.Errorf("auth: protected role %q is not one of the table's roles", r)
 		}
 	}
-	c := *t
-	c.protected = append([]Role(nil), roles...)
-	return &c, nil
+	c := t.clone()
+	s := *c.state()
+	s.protected = append([]Role(nil), roles...)
+	c.st.Store(&s)
+	return c, nil
 }
 
 // WithPrivilegedRoles returns a copy of the table in which acting on an
@@ -237,7 +297,7 @@ func (t *PermissionTable) WithRoleGuards(guards map[Role]Permission) (*Permissio
 	}
 	for p := range perms {
 		holders := 0
-		for role, held := range t.perms {
+		for role, held := range t.state().perms {
 			if !held[p] {
 				continue
 			}
@@ -253,12 +313,14 @@ func (t *PermissionTable) WithRoleGuards(guards map[Role]Permission) (*Permissio
 			return nil, fmt.Errorf("auth: no role carries %q, so no one could manage the roles it guards", p)
 		}
 	}
-	c := *t
-	c.guards = make(map[Role]Permission, len(guards))
+	c := t.clone()
+	s := *c.state()
+	s.guards = make(map[Role]Permission, len(guards))
 	for r, p := range guards {
-		c.guards[r] = p
+		s.guards[r] = p
 	}
-	return &c, nil
+	c.st.Store(&s)
+	return c, nil
 }
 
 // Protected reports whether an organization must keep at least one enabled
@@ -267,10 +329,11 @@ func (t *PermissionTable) Protected(role Role) bool {
 	if t == nil {
 		return false
 	}
-	if t.protected == nil {
+	st := t.state()
+	if st.protected == nil {
 		return role == t.AdminRole
 	}
-	for _, r := range t.protected {
+	for _, r := range st.protected {
 		if r == role {
 			return true
 		}
@@ -285,7 +348,7 @@ func (t *PermissionTable) Privileged(role Role) bool {
 	if t == nil {
 		return false
 	}
-	_, ok := t.guards[role]
+	_, ok := t.state().guards[role]
 	return ok
 }
 
@@ -298,7 +361,7 @@ func (t *PermissionTable) MayHandle(callerRole, role Role) bool {
 	if !t.Privileged(role) {
 		return true
 	}
-	return t.Can(callerRole, t.guards[role])
+	return t.Can(callerRole, t.state().guards[role])
 }
 
 // Roles returns every role the table defines, sorted, so a deployment can
@@ -308,8 +371,9 @@ func (t *PermissionTable) Roles() []Role {
 	if t == nil {
 		return nil
 	}
-	out := make([]Role, 0, len(t.perms))
-	for r := range t.perms {
+	perms := t.state().perms
+	out := make([]Role, 0, len(perms))
+	for r := range perms {
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
@@ -322,7 +386,7 @@ func (t *PermissionTable) Permissions(role Role) []Permission {
 	if t == nil {
 		return nil
 	}
-	set := t.perms[role]
+	set := t.state().perms[role]
 	if set == nil {
 		return nil
 	}
@@ -339,7 +403,7 @@ func (t *PermissionTable) Valid(role Role) bool {
 	if t == nil {
 		return false
 	}
-	_, ok := t.perms[role]
+	_, ok := t.state().perms[role]
 	return ok
 }
 
@@ -380,10 +444,11 @@ func (t *PermissionTable) AtMost(role, ceiling Role) Role {
 	if t == nil {
 		return ""
 	}
-	if containsAll(t.perms[ceiling], t.perms[role]) {
+	perms := t.state().perms
+	if containsAll(perms[ceiling], perms[role]) {
 		return role
 	}
-	if containsAll(t.perms[role], t.perms[ceiling]) {
+	if containsAll(perms[role], perms[ceiling]) {
 		return ceiling
 	}
 	return ""
