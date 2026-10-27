@@ -120,6 +120,23 @@ table, err = table.WithProtectedRoles(RoleSuperAdmin)
 
 Each returns a copy; with none set the table behaves as before.
 
+### Editing the table at run time
+
+A table is built once, but a deployment whose roles are edited by its own
+administrators can change it in place. Build the new table exactly as at
+startup (so every construction check runs) and hand it to `Replace`:
+
+```go
+next, err := auth.NewPermissionTable(rolesFromDB, PermManageUsers, RoleOwner)
+// ... With* options ...
+err = table.Replace(next) // every Authenticator, Admin and Identity holding `table` sees it
+```
+
+`Replace` is safe against concurrent readers, and each check reads the rules
+once, so it sees the old rules or the new, never a mixture. `ManageUsers` and
+the admin role must match the receiver's. Sessions store a role, not its
+permissions, so an edited role takes effect on the holder's next request.
+
 Every authorization decision goes through `Can`, most often via the
 `Identity` it was resolved against:
 
